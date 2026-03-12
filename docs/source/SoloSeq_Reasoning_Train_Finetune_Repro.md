@@ -68,6 +68,7 @@ bash Miniconda3-latest-Linux-x86_64.sh
 ```bash
 conda create -n Fedfold python=3.10
 conda activate Fedfold
+pip install -r requirements.txt
 ```
 
 这里我使用的工作站显卡A4500, 推荐cuda版本12.0，请GPT一下自己的显卡对应的cuda以及torch版本。另外sm120架构的新版blackwell显卡们对应的torch好像已经解决了。
@@ -107,7 +108,7 @@ python -c "import openfold; print(openfold.__file__)"
 官方文档入口：
 ```bash
 python run_pretrained_openfold.py \
-    fasta_dir \
+    examples/monomer/fasta_dir \
     data/pdb_mmcif/mmcif_files/ \
     --use_precomputed_alignments embeddings_output_dir \
     --output_dir ./ \
@@ -115,3 +116,4 @@ python run_pretrained_openfold.py \
     --config_preset "seq_model_esm1b_ptm" \
     --openfold_checkpoint_path openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt
 ```
+
