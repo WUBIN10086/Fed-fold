@@ -117,3 +117,34 @@ python run_pretrained_openfold.py \
     --openfold_checkpoint_path openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt
 ```
 
+## 生成结果验证
+
+*根据GPT老师的说法*
+
+常用两周测试方法：
++ pLDDT
++ TM-score
+
+### pLDDT验证方法
+
+我创建了一个新的脚本，放在了`scripts/`里面,`plddt_from_pdb.py`,使用方法：
+```bash
+python3 scripts/plddt_from_pdb.py /path/to/your/test file.pdb
+```
+
+pLDDT分析结果，GPT说平均值大于80基本表示良好：
+```
+P62068_seq_model_esm1b_ptm_unrelaxed.pdb
+残基数: 366（chain A）
+平均 pLDDT: 85.63
+最小/最大: 22.21 / 98.19
+分布:
+<50: 24（6.6%）
+50–70: 27（7.4%）
+70–90: 86（23.5%）
+≥90: 229（62.6%）
+最低 pLDDT 残基（前 10）: A1(22.21), A10(26.90), A2(27.14), A4(27.51), A8(28.24), A7(28.31), A3(28.60), A9(28.62), A5(28.77), A6(33.36)
+```
+
+### TM-score
+
