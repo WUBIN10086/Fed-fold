@@ -1,12 +1,18 @@
 ![header ](imgs/of_banner.png)
 _Figure: Comparison of OpenFold and AlphaFold2 predictions to the experimental structure of PDB 7KDX, chain B._
 
-# OpenFold
+# FedFold重写版文档
 
 A faithful but trainable PyTorch reproduction of DeepMind's 
 [AlphaFold 2](https://github.com/deepmind/alphafold).
 
-# Documentation
+# 三条路线：
+1. SoloSeq 路线：不依赖 MSA，直接做单序列训练
+（[soloseq推理，训练，微调流程复现文档](docs/source/SoloSeq_Reasoning_Train_Finetune_Repro.md)）
+2. 标准 OpenFold 路线：自己生成 MSA（DeepMind 方法）
+3. 直接用 RODA 数据：最快进入训练状态的大规模路线
+
+# openfold原始文档引导
 See our new home for docs at [openfold.readthedocs.io](https://openfold.readthedocs.io/en/latest/), with instructions for installation and model inference/training.
 
 Much of the content from this page may be found [here.](https://github.com/aqlaboratory/openfold/blob/main/docs/source/original_readme.md)
