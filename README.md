@@ -12,6 +12,9 @@ A faithful but trainable PyTorch reproduction of DeepMind's
 2. 标准 OpenFold 路线：自己生成 MSA（DeepMind 方法）
 3. 直接用 RODA 数据：最快进入训练状态的大规模路线
 
+# 任务分配
+[请查看文档](docs/source/数据筛选.md)
+
 # openfold原始文档引导
 See our new home for docs at [openfold.readthedocs.io](https://openfold.readthedocs.io/en/latest/), with instructions for installation and model inference/training.
 
