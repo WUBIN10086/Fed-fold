@@ -6,13 +6,28 @@ from pathlib import Path
 
 payload = {
     "query": {
-        "type": "terminal",
-        "service": "text",
-        "parameters": {
-            "attribute": "rcsb_accession_info.initial_release_date",
-            "operator": "greater_or_equal",
-            "value": "2025-01-01"
-        }
+        "type": "group",
+        "logical_operator": "and",
+        "nodes": [
+            {
+                "type": "terminal",
+                "service": "text",
+                "parameters": {
+                    "attribute": "rcsb_accession_info.initial_release_date",
+                    "operator": "greater_or_equal",
+                    "value": "2025-01-01"
+                }
+            },
+            {
+                "type": "terminal",
+                "service": "text",
+                "parameters": {
+                    "attribute": "rcsb_accession_info.initial_release_date",
+                    "operator": "less_or_equal",
+                    "value": "2026-02-28"
+                }
+            }
+        ]
     },
     "return_type": "entry",
     "request_options": {
