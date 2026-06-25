@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import csv
+target_csv_dir = "./data/pdb_recent/sequence_plddt_lower_than_80.csv"
 
 @dataclass(frozen=True)
 class ResidueKey:
@@ -171,6 +173,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"min\t{summary.min:.2f}")
         print(f"max\t{summary.max:.2f}")
         print()
+
+        # write the sequence id and pLDDT into the csv file
+        if summary.mean < 80:
+            with open(target_csv_dir, 'a', newline='') as csvfile:
+                filename = str(pdb_path).split('/')[-1]        # "7GR2_A_seq_model_esm1b_ptm_unrelaxed.pdb"
+                parts = filename.split('_')
+                seq_name = f"{parts[0]}_{parts[1]}"   # "7GR2_A"
+                writer = csv.writer(csvfile)
+                writer.writerow([seq_name, f"{summary.mean:.2f}"])
 
         print("== Bins ==")
         for k in ("<50", "50-70", "70-90", ">=90"):

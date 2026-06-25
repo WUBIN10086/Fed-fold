@@ -92,8 +92,10 @@ class EmbeddingGenerator:
                 continue
             with open(os.path.join(fasta_dir, f), 'r') as infile:
                 seq = infile.readlines()[1].strip()
-            labels.append(f_name)
-            seqs.append(seq)
+            # maximum sequence length is 1024
+            if (len(seq) <= 1024):
+                labels.append(f_name)
+                seqs.append(seq)
         
         lines = []
         for label, seq in zip(labels, seqs):

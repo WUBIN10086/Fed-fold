@@ -30,8 +30,14 @@ def main(args):
             mmcif = mmcif.mmcif_object
             for chain, seq in mmcif.chain_to_seqres.items():
                 chain_id = '_'.join([basename, chain])
-                fasta.append(f">{chain_id}")
-                fasta.append(seq)
+                # fasta.append(f">{chain_id}")
+                # fasta.append(seq)
+                
+                # Generate a FASTA file for each chain
+                with open(args.output_path + chain_id + ".fasta", "w") as fp:
+                    fp.write(f">{chain_id}\n")
+                    fp.write(seq)
+
         elif(ext == ".pdb"):
             with open(fpath, 'r') as fp:
                 pdb_str = fp.read()
@@ -63,10 +69,9 @@ def main(args):
             ])
             fasta.append(f">{basename}")
             fasta.append(seq)
-            
 
-    with open(args.output_path, "w") as fp:
-        fp.write('\n'.join(fasta))
+    # with open(args.output_path, "w") as fp:
+    #     fp.write('\n'.join(fasta))
 
 
 if __name__ == "__main__":

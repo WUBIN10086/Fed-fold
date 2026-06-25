@@ -15,7 +15,7 @@ payload = {
                 "parameters": {
                     "attribute": "rcsb_accession_info.initial_release_date",
                     "operator": "greater_or_equal",
-                    "value": "2025-01-01"
+                    "value": "2025-10-01"
                 }
             },
             {
@@ -24,7 +24,7 @@ payload = {
                 "parameters": {
                     "attribute": "rcsb_accession_info.initial_release_date",
                     "operator": "less_or_equal",
-                    "value": "2026-02-28"
+                    "value": "2025-12-31"
                 }
             }
         ]

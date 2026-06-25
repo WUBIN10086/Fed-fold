@@ -23,7 +23,7 @@ DOWNLOAD_DIR="$1"
 ROOT_DIR="${DOWNLOAD_DIR}/mmseqs_dbs"
 mkdir -p $ROOT_DIR
 
-for f in $(ls ${DOWNLOAD_DIR}/*.tar*)
+for f in $(ls ${DOWNLOAD_DIR}/uniref30/*.tar*)
 do
   tar --extract --verbose --file="${f}" \
       --directory=$ROOT_DIR
