@@ -111,6 +111,7 @@ def np_example_to_features(
                 cfg[mode],
             )
 
+
     if mode == "train":
         p = torch.rand(1).item()
         use_clamped_fape_value = float(p < cfg.supervised.clamp_prob)

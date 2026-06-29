@@ -856,7 +856,9 @@ class DataPipeline:
 
             if (ext == ".pt"):
                 # Load embedding file
-                seqemb_data = torch.load(path)
+                # weights_only=False: these are locally-generated ESM
+                # embedding files (trusted) holding a dict of tensors.
+                seqemb_data = torch.load(path, weights_only=False)
                 seqemb_features["seq_embedding"] = seqemb_data["representations"][33]
 
         return seqemb_features

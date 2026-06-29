@@ -220,12 +220,25 @@ def model_config(
             c.data.common.use_templates = True
             c.data.common.use_template_torsion_angles = True
             c.model.template.enabled = True
+            # In seqemb mode there is no MSA: the embedder emits a single
+            # sequence row, so the MSA features must be single-row in every
+            # mode (not just predict), otherwise msa_mask / m row counts
+            # disagree in the Evoformer.
+            c.data.train.max_msa_clusters = 1
+            c.data.eval.max_msa_clusters = 1
             c.data.predict.max_msa_clusters = 1
+            c.data.train.block_delete_msa = False
+            c.data.train.max_distillation_msa_clusters = 1
         elif name == "seq_model_esm1b_ptm":
             c.data.common.use_templates = True
             c.data.common.use_template_torsion_angles = True
             c.model.template.enabled = True
+            # See seq_model_esm1b: single-row MSA required in all modes.
+            c.data.train.max_msa_clusters = 1
+            c.data.eval.max_msa_clusters = 1
             c.data.predict.max_msa_clusters = 1
+            c.data.train.block_delete_msa = False
+            c.data.train.max_distillation_msa_clusters = 1
             c.model.heads.tm.enabled = True
             c.loss.tm.weight = 0.1
     elif "multimer" in name:  # MULTIMER PRESETS

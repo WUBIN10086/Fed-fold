@@ -379,6 +379,11 @@ def to_pdb(prot: Protein) -> str:
             atom_index += 1 # Atom index increases at the TER symbol.
 
         res_name_3 = res_1to3(aatype[i])
+        # Define chain_tag once per residue so the chain-termination block below
+        # is safe even when every atom of this residue is masked out.
+        chain_tag = "A"
+        if(chain_index is not None):
+            chain_tag = chain_tags[chain_index[i]]
         for atom_name, pos, mask, b_factor in zip(
             atom_types, atom_positions[i], atom_mask[i], b_factors[i]
         ):
@@ -394,10 +399,6 @@ def to_pdb(prot: Protein) -> str:
                 0
             ]  # Protein supports only C, N, O, S, this works.
             charge = ""
-
-            chain_tag = "A"
-            if(chain_index is not None):
-                chain_tag = chain_tags[chain_index[i]]
 
             # PDB is a columnar format, every space matters here!
             atom_line = (

@@ -23,6 +23,37 @@ from openfold.utils.tensor_utils import (
 )
 
 
+# Solotrain: Added a class
+class SoloSeqEmbeddingDataset(torch.utils.data.Dataset):
+    def __init__(self, embedding_dir, chain_data_cache):
+        self.samples = []
+
+        for chain in os.listdir(embedding_dir):
+            chain_dir = os.path.join(embedding_dir, chain)
+            if not os.path.isdir(chain_dir):
+                continue
+
+            pt = os.path.join(chain_dir, f"{chain}.pt")
+            if os.path.exists(pt):
+                self.samples.append((chain, pt))
+
+        print("SoloSeq dataset size:", len(self.samples))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        chain, pt = self.samples[idx]
+        data = torch.load(pt)
+
+        embedding = data["representations"]["esm1b"]
+
+        return {
+            "chain_id": chain,
+            "embedding": embedding
+        }
+
+
 class OpenFoldSingleDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_dir: str,
@@ -541,7 +572,9 @@ class OpenFoldDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self,
-                 datasets: Union[Sequence[OpenFoldSingleDataset], Sequence[OpenFoldSingleMultimerDataset]],
+                # Solotrain: Replace OpenFoldSingleDataset with SoloSeqEmbeddingDataset
+                #  datasets: Union[Sequence[OpenFoldSingleDataset], Sequence[OpenFoldSingleMultimerDataset]],
+                 datasets: Union[Sequence[SoloSeqEmbeddingDataset], Sequence[OpenFoldSingleMultimerDataset]],
                  probabilities: Sequence[float],
                  epoch_len: int,
                  generator: torch.Generator = None,
@@ -1184,3 +1217,4 @@ class DummyDataLoader(pl.LightningDataModule):
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.dataset)
+

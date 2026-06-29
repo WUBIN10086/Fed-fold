@@ -105,3 +105,42 @@ Computed exactly as `_compute_plddt.sh` (per-residue CA pLDDT from the PDB B-fac
 - **57.1%** of predictions have mean pLDDT < 80 (1829 chains, the CSV); only **14.4%** are high-confidence (≥90). Consistent with single-sequence (MSA-free) SoloSeq prediction, which is expected to be lower-confidence than MSA-based OpenFold.
 - Note: these predictions predate the finetuning run analyzed above — they are a baseline of the inference model, not an evaluation of `epoch=0-step=10000.ckpt`.
 
+# Finetuned vs baseline pLDDT comparison (2026-06-25, PARTIAL — short chains only)
+
+Re-ran inference with the finetuned checkpoint `run_260616_180217/checkpoints/epoch=0-step=10000.ckpt` (loaded via `run_pretrained_openfold.py`, which auto-consolidates the DeepSpeed dir and uses the EMA weights) and compared per-chain mean pLDDT against the baseline (`seq_model_esm1b_ptm.pt`, in `plddt_compute.log`).
+
+### Setup / how it was run
+- Embeddings had been renamed to lowercase on Jun 16, but FASTA tags are uppercase (`13SI_A`). Bridged with uppercase symlinks: `data/pdb_recent/ft_infer_aln/<TAG>` → lowercase embedding dir, and a flat `ft_infer_fastas/`. Ran once (model loads once) with `--skip_relaxation` (pLDDT lives in the unrelaxed PDB, so relaxation is irrelevant and skipping it is ~faithful + far faster).
+- Output: `data/pdb_recent/soloseq_inference_finetuned/predictions/`. Compare script: `scripts/compare_plddt_finetuned_vs_baseline.py` → `data/pdb_recent/plddt_finetuned_vs_baseline.csv`.
+- **Bug fixed to make this run**: `openfold/np/protein.py:to_pdb` raised `UnboundLocalError: chain_tag` on degenerate predictions (all atoms of a residue masked). Hoisted the `chain_tag` assignment above the inner atom loop.
+
+### ⚠️ Incomplete + biased sample
+Inference was **killed at 938/3210 chains (29%)**; 934 scored. Targets are processed **shortest-sequence-first**, so the completed set is the **short proteins only**: mean length **88** residues (median 95, max 139) vs **264** (median 215, max 985) across the full set. The numbers below do **not** generalize to longer chains.
+
+### Results (n=934, short chains)
+- Mean pLDDT **76.89 → 74.98** (mean delta **−1.90**, median **−4.40**, std 9.77, range −20.6 … +49.0).
+- **67.9% of chains worsened**, 32.1% improved. |delta|≥5: down 45.8%, up 16.4%.
+- Confidence-band (80) migration: stayed ≥80: 269; **dropped ≥80→<80: 213**; rose <80→≥80: 73; stayed <80: 379 → net **+140 chains pushed below 80**.
+- Extremes: biggest drops `9DNI_A/B 86.6→66.0 (−20.6)`, `8ZP8_B5 78.9→62.5`. Biggest gains are baseline near-failures **rescued**: `7IPI_A/7ICX_A/7IBY_A 31.5→80.5 (+49)`, `7IEF_A/7IDX_A 31.6→80.5`.
+
+### Interpretation
+On short chains, this finetuning **lowered the model's self-confidence on average** (most chains down a few pLDDT points) while **rescuing a handful of catastrophic baseline failures** (~31 → ~80). Caveats: (1) pLDDT is confidence, not accuracy — a real verdict needs lDDT/TM vs ground truth; (2) lineages differ (baseline = original `seq_model_esm1b_ptm.pt`; finetune started from `..._finetuning_260331.pt`); (3) sample is short-chain-biased and only 29% complete. **To finish**: resume inference on the remaining 2272 chains, then rerun the compare script.
+
+# 3-epoch finetuning experiment, clean lineage (job 40, submitted 2026-06-29) — IN PROGRESS
+
+Addresses the lineage + epoch-count + accuracy-metric gaps above. Confirmed the previous setup used `--max_epochs` default = **1** (one "epoch" = `train_epoch_len` 10000 stochastically-sampled chains, ≈4 passes over the 2479-chain train set, NOT one traversal).
+
+### Configuration changes (`_finetune_openfold.sh`)
+1. **Clean lineage**: `--resume_from_ckpt` → `seq_model_esm1b_ptm.pt` (the SAME weights the baseline pLDDT/lDDT CSVs were generated from), so baseline = true "before".
+2. **3 epochs, checkpoint each**: `--max_epochs 3 --checkpoint_every_epoch` (`ModelCheckpoint(every_n_epochs=1, save_top_k=-1)` keeps all 3). Pick the best epoch by `val/lddt_ca`.
+3. Validation (added earlier) confirmed working at startup — logs `val/lddt_ca`, `val/gdt_ts`, `val/gdt_ha`, `val/drmsd_ca` per epoch to `lightning_logs/.../metrics.csv` on the 121 held-out chains.
+- Submitted via `sbatch _finetune_openfold.slurm` → **job 40** on `tornade` (2× RTX 6000 Ada). ETA ~16 h/epoch → **~48 h total**. Partition `normal` time limit = infinite (no wall-time kill).
+
+### Accuracy-metric tooling (built + validated)
+- `scripts/lddt_from_predictions.py` — global **lDDT-Cα** of predicted `*unrelaxed.pdb` vs experimental mmCIF, reusing OpenFold's `lddt_ca` + `mmcif_parsing.get_atom_coords` (position-aligned to seqres; length mismatches skipped + reported, no silent truncation). Validated on baseline: 13SI homomer chains share pLDDT 85.1 but resolve to distinct true lDDT 85.8–96.5.
+- Baseline lDDT for the full set → `data/pdb_recent/baseline_lddt.csv` (the lDDT "before"): **3170 chains scored** (40 skipped: 8 empty preds, 32 pred/GT length mismatches — reported, not silently dropped), **mean lDDT-Cα 76.21, median 80.61** (std 16.7; <50: 9.4%, 50–70: 20.6%, 70–90: 49.2%, ≥90: 20.9%). **pLDDT↔lDDT correlation r=0.839** — pLDDT is a strong accuracy proxy here, so the confidence drop seen above likely tracks a real accuracy change.
+- `_eval_checkpoint.sh <ckpt_dir> <tag>` — one command per checkpoint: inference over all 3210 chains (reusing `ft_infer_fastas/` + `ft_infer_aln/`, `--skip_relaxation`) → per-chain pLDDT → per-chain lDDT-Cα. Outputs under `data/pdb_recent/ckpt_eval_<tag>/`.
+
+### Post-training plan (run when job 40 finishes)
+For each of the 3 epoch checkpoints: `bash _eval_checkpoint.sh <epoch_ckpt> ep{1,2,3}`, then compare per-chain **pLDDT** (vs `plddt_compute.log`) and **lDDT-Cα** (vs `baseline_lddt.csv`) — both confidence and accuracy, across epochs, against the same-lineage baseline. Also read `val/lddt_ca` per epoch from `metrics.csv` for model selection.
+

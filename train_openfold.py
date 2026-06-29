@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks.lr_monitor import LearningRateMonitor
 from pytorch_lightning.callbacks import DeviceStatsMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import WandbLogger, CSVLogger
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning import seed_everything
@@ -412,6 +412,12 @@ def main(args):
         )
         loggers.append(wdb_logger)
 
+    if not args.wandb:
+        # Without a logger, all self.log(...) metrics (incl. validation) are
+        # silently dropped. Fall back to a local CSVLogger so train/val metrics
+        # land in <output_dir>/lightning_logs/version_*/metrics.csv.
+        loggers.append(CSVLogger(save_dir=args.output_dir))
+
     cluster_environment = MPIEnvironment() if args.mpi_plugin else None
     if(args.deepspeed_config_path is not None):
         strategy = DeepSpeedStrategy(
@@ -433,8 +439,10 @@ def main(args):
         wdb_logger.experiment.save(f"{freeze_path}")
 
     trainer_kws = ['num_nodes', 'precision', 'max_epochs', 'log_every_n_steps',
-                   'flush_logs_ever_n_steps', 'num_sanity_val_steps', 'reload_dataloaders_every_n_epochs']
-    trainer_args = {k: v for k, v in vars(args).items() if k in trainer_kws}
+                   'flush_logs_ever_n_steps', 'num_sanity_val_steps', 'reload_dataloaders_every_n_epochs',
+                   'val_check_interval']
+    trainer_args = {k: v for k, v in vars(args).items()
+                    if k in trainer_kws and v is not None}
     trainer_args.update({
         'default_root_dir': args.output_dir,
         'strategy': strategy,
@@ -681,6 +689,12 @@ if __name__ == "__main__":
     )
     trainer_group.add_argument(
         "--reload_dataloaders_every_n_epochs", type=int, default=1,
+    )
+    trainer_group.add_argument(
+        "--val_check_interval", type=float, default=None,
+        help="How often to run validation within a training epoch. A float in "
+             "(0,1] is a fraction of the epoch; an int is a number of steps. "
+             "With train_epoch_len=10000, 0.25 validates every 2500 steps.",
     )
     trainer_group.add_argument(
         "--accumulate_grad_batches", type=int, default=1,
