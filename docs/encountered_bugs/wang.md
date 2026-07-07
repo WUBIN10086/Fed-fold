@@ -126,7 +126,7 @@ Inference was **killed at 938/3210 chains (29%)**; 934 scored. Targets are proce
 ### Interpretation
 On short chains, this finetuning **lowered the model's self-confidence on average** (most chains down a few pLDDT points) while **rescuing a handful of catastrophic baseline failures** (~31 → ~80). Caveats: (1) pLDDT is confidence, not accuracy — a real verdict needs lDDT/TM vs ground truth; (2) lineages differ (baseline = original `seq_model_esm1b_ptm.pt`; finetune started from `..._finetuning_260331.pt`); (3) sample is short-chain-biased and only 29% complete. **To finish**: resume inference on the remaining 2272 chains, then rerun the compare script.
 
-# 3-epoch finetuning experiment, clean lineage (job 40, submitted 2026-06-29) — IN PROGRESS
+# 3-epoch finetuning experiment, clean lineage (job 40, submitted 2026-06-29) — COMPLETE (2026-07-02)
 
 Addresses the lineage + epoch-count + accuracy-metric gaps above. Confirmed the previous setup used `--max_epochs` default = **1** (one "epoch" = `train_epoch_len` 10000 stochastically-sampled chains, ≈4 passes over the 2479-chain train set, NOT one traversal).
 
@@ -143,4 +143,63 @@ Addresses the lineage + epoch-count + accuracy-metric gaps above. Confirmed the 
 
 ### Post-training plan (run when job 40 finishes)
 For each of the 3 epoch checkpoints: `bash _eval_checkpoint.sh <epoch_ckpt> ep{1,2,3}`, then compare per-chain **pLDDT** (vs `plddt_compute.log`) and **lDDT-Cα** (vs `baseline_lddt.csv`) — both confidence and accuracy, across epochs, against the same-lineage baseline. Also read `val/lddt_ca` per epoch from `metrics.csv` for model selection.
+
+### Completion status (checked 2026-07-02)
+Job 40 (run dir `run_260629_152451`) **finished cleanly** — `Trainer.fit stopped: max_epochs=3 reached`, all 3 epochs done, final validation completed **Jul 1 19:18** (~48 h wall-clock, ~0.16 it/s). No crash, no NaN/Inf. SLURM no longer lists the job (accounting is disabled on this cluster), so completion was confirmed from the logs + outputs, not `sacct`.
+
+### Checkpoint-path bug — checkpoints saved to the wrong dir, root-caused + fixed
+`--checkpoint_every_epoch` produced **12** checkpoints (saved at every validation, i.e. every 2500 steps: `{epoch}-{step}` = `0-2500 … 2-30000`, not just the 3 epoch-end ones), but they landed under `run_260629_152451/lightning_logs/version_0/checkpoints/` instead of the expected `run_260629_152451/checkpoints/` (where `run_260616_180217` had put them).
+- **Root cause**: `ModelCheckpoint(...)` in `train_openfold.py` had **no explicit `dirpath`**. When no logger is present (the old run), Lightning defaults the dir to `default_root_dir/checkpoints` = `<output_dir>/checkpoints`. But this run added a **CSVLogger** (the validation/logging fix from the previous section), and Lightning then silently re-routes a dirpath-less `ModelCheckpoint` into the logger's versioned dir `lightning_logs/version_*/checkpoints/`. So the very fix that added logging is what moved the checkpoints.
+- **Fix (permanent)**: pinned `dirpath=os.path.join(args.output_dir, "checkpoints")` on the `ModelCheckpoint` (`train_openfold.py`, in the `--checkpoint_every_epoch` block) so the location is deterministic regardless of whether a logger is attached. Future runs write straight to `<output_dir>/checkpoints/`.
+- **This run**: the 12 existing `.ckpt` dirs were `mv`'d to `run_260629_152451/checkpoints/` and the now-empty `lightning_logs/version_0/checkpoints/` removed (metrics.csv under `lightning_logs/version_0/` untouched). Epoch-end checkpoints = `0-10000` (ep1), `1-20000` (ep2), `2-30000` (ep3).
+
+### Validation trend across epochs (held-out 121 chains, from `lightning_logs/version_0/metrics.csv`)
+`val/lddt_ca` on a 0–1 scale (validated 4×/epoch via `--val_check_interval 0.25`):
+
+| checkpoint | val/lddt_ca | gdt_ts | gdt_ha | drmsd_ca↓ |
+|---|---|---|---|---|
+| 0-10000 (ep1 end) | 0.5745 | 0.339 | 0.223 | 9.71 |
+| 1-20000 (ep2 end) | 0.5892 | 0.387 | 0.258 | 8.68 |
+| 2-30000 (ep3 end) | 0.5881 | 0.391 | 0.263 | 8.96 |
+| **2-25000 (overall peak)** | **0.5979** | 0.396 | 0.265 | 8.98 |
+
+- Unlike the previous flat run, this shows a **real monotonic improvement** in accuracy-correlated metrics across epochs (lddt_ca 0.55→0.60, gdt_ts 0.33→0.40, drmsd falling). ep2 and ep3 are essentially tied on lDDT; the overall peak is mid-epoch-3 (`2-25000`).
+- **Caveat — do NOT select on `val/loss`**: aggregate `val/loss` *rises* (44→60) even as lDDT/GDT improve, i.e. it's driven up by a non-structural component (likely plddt_loss/violation), not by worse structures. `val/lddt_ca` is the correct model-selection monitor here.
+
+### Post-training eval — first launch CRASHED (2026-07-02), root-caused + fixed, relaunched 2026-07-06
+Running directly on `tornade` (both A6000s free; no SLURM wrapper for eval). `_eval_all_epochs.sh` (new driver) runs `_eval_checkpoint.sh` sequentially on the 3 epoch-end checkpoints ep1=`0-10000`, ep2=`1-20000`, ep3=`2-30000`, each: inference over all 3210 chains (`--skip_relaxation`, cuda:0) → per-chain pLDDT → per-chain lDDT-Cα. Detached via `nohup`, log `data/pdb_recent/eval_all_epochs.log`; outputs under `data/pdb_recent/ckpt_eval_ep{1,2,3}/`.
+
+**Runtime reality check**: inference is **~12.5 h per checkpoint** (~14 s/chain avg — long chains dominate; my earlier "1.6 s/chain ⇒ 1.5 h" was measured on the short chains that run first and is wrong for the full set). All 3 epochs ≈ **26 h + pLDDT/lDDT**.
+
+**The crash (`set -e` + `pipefail` bug in `_eval_checkpoint.sh`)**: ep1 inference finished (3210 preds), then the pLDDT step died at the 118th prediction, `8ZOE_g` — a degenerate 486-byte PDB with no scoreable Cα. `plddt_from_pdb.py` exits non-zero on it, and under `pipefail` the failing pipeline `m=$(python … | awk …)` propagates non-zero to the **assignment**, which `set -e` treats as fatal — killing the script *before* any `[ -n "$m" ]` guard could run. Because the driver also had `set -e`, ep2/ep3 never started. Net: only 117 pLDDT rows, no lDDT anywhere; silently dead since Jul 3 02:56 (~3 days).
+- Same failure class also lurked in the (added) inference-skip guard: `NPRED=$(find "$PRED" … | wc -l)` dies on a missing predictions dir (find exits 1 → pipefail → set -e).
+- **Fixes** (`_eval_checkpoint.sh`): (1) `m=$(… | awk …) || m=""` so an unscoreable prediction yields empty `m` and is skipped (with a `[warn]` line + skip count) instead of aborting; (2) guard the find with `if [ -d "$PRED" ]` so a missing dir → `NPRED=0`; (3) inference-skip guard so a checkpoint whose 3210 predictions already exist is not recomputed (ep1's completed inference is reused on relaunch). `_eval_all_epochs.sh`: wrap each epoch in `if …; then DONE; else FAILED — continuing; fi` so one bad checkpoint no longer aborts the rest. All verified under real `set -eo pipefail` (ep1 now skips `8ZOE_g` and continues past the old row-117 wall).
+- **Lesson**: any `var=$(cmd1 | cmd2)` in a `set -eo pipefail` script is fatal if either stage can exit non-zero — append `|| var=""` (or guard the input). Don't rely on a downstream `[ -n "$var" ]` check; the script dies at the assignment first.
+
+When all 3 finish: compare per-chain pLDDT vs `plddt_compute.log` and lDDT-Cα vs `baseline_lddt.csv`; pick the best epoch by held-out `val/lddt_ca` (peak `2-25000`, ep-ends `1-20000`≈`2-30000`), and cross-check against measured lDDT here.
+
+### Eval COMPLETE (2026-07-07 17:40) — full 3-metric results
+All 3 epoch checkpoints evaluated cleanly over 3210 chains each (`ALL EPOCH EVALS COMPLETE`; ep2 ~12.7 h, ep3 ~12.8 h, ep1 ~16 min reusing existing preds). Each set: 3202 pLDDT-scored, 3170 lDDT/TM-scored (the 8 empty + 32 pred/GT length-mismatch skips are the same known ones). Outputs: `ckpt_eval_ep{1,2,3}/{plddt,lddt,tm}_per_chain.csv`.
+
+**Metrics vs same-lineage baseline** (`seq_model_esm1b_ptm.pt`), paired per-chain on the common set:
+
+| metric | baseline | ep1 (`0-10000`) | ep2 (`1-20000`) | ep3 (`2-30000`) |
+|---|---|---|---|---|
+| **lDDT-Cα** mean | 76.21 | 79.46 (+3.26) | 82.35 (+6.14) | **83.70 (+7.49)** |
+| **lDDT-Cα** median | 80.61 | 83.20 | 86.49 | **88.28** |
+| **TM-score** mean | 0.586 | 0.679 (+0.093) | 0.733 (+0.147) | **0.756 (+0.170)** |
+| **TM-score** median | 0.625 | 0.801 | 0.851 | **0.875** |
+| **pLDDT** mean | 74.03 | 71.12 (−2.91) | 74.59 (+0.56) | 75.45 (+1.42) |
+| **pLDDT** median Δ | — | −5.06 | −2.61 | −1.71 |
+| % chains improved (TM) | — | 64.6% | 71.0% | 72.5% |
+| % chains improved (lDDT) | — | 54.2% | 63.7% | 65.6% |
+| % chains improved (pLDDT) | — | 30.8% | 42.0% | 45.1% |
+
+**Verdict**: finetuning clearly **improved accuracy**, monotonically with epochs — best at **ep3 (`2-30000`, final epoch)** on all three metrics, no overfitting on the full set. TM mean 0.586→0.756 moves the model from the borderline "correct fold" region into solidly-correct territory (median TM 0.625→0.875). This ranks ep3 first; the 121-chain `val/lddt_ca` had ep2≈ep3, so trust the full 3170-chain result.
+
+**Key finding — confidence and accuracy diverge**: pLDDT (self-confidence) barely moves and by *median* drops for every epoch (fewer than half the chains gain confidence); its mean is dragged positive only by a subset of rescued near-failures. So the model became **more accurate while slightly less confident** — the earlier pLDDT-only comparison (2026-06-25, which read as "finetuning hurt") was misleading. **Judge SoloSeq finetuning by lDDT/TM vs ground truth, not by pLDDT.**
+
+**TM caveat**: TM here uses the repo's RMSD/Kabsch superposition (`openfold/utils/superimposition.superimpose`, the same one used for GDT), NOT TMalign's TM-optimal rotation, so absolute TM is a mild underestimate — but it is applied identically to baseline and all epochs, so relative comparisons are valid. Wire in TMalign if publication-grade absolute TM is needed.
+
+**New tooling**: `scripts/tm_from_predictions.py` (global TM-Cα of predicted `*unrelaxed.pdb` vs experimental mmCIF, mirrors `lddt_from_predictions.py`); `scripts/compare_metrics_epochs.py` (paired per-chain pLDDT/lDDT/TM deltas per epoch vs baseline). Baseline TM → `data/pdb_recent/baseline_tm.csv`; combined long-format table → `data/pdb_recent/metrics_epochs_vs_baseline.csv`.
 

@@ -358,6 +358,12 @@ def main(args):
     callbacks = []
     if (args.checkpoint_every_epoch):
         mc = ModelCheckpoint(
+            # Pin the checkpoint dir explicitly. Without dirpath, Lightning puts
+            # checkpoints under default_root_dir/checkpoints ONLY when no logger
+            # is present; once a logger (e.g. CSVLogger) is added it silently
+            # re-routes them into lightning_logs/version_*/checkpoints. Setting
+            # dirpath keeps them at <output_dir>/checkpoints regardless.
+            dirpath=os.path.join(args.output_dir, "checkpoints"),
             every_n_epochs=1,
             auto_insert_metric_name=False,
             save_top_k=-1,
