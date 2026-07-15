@@ -15,7 +15,7 @@ payload = {
                 "parameters": {
                     "attribute": "rcsb_accession_info.initial_release_date",
                     "operator": "greater_or_equal",
-                    "value": "2025-01-01"
+                    "value": "2025-07-01"
                 }
             },
             {
@@ -24,7 +24,7 @@ payload = {
                 "parameters": {
                     "attribute": "rcsb_accession_info.initial_release_date",
                     "operator": "less_or_equal",
-                    "value": "2026-02-28"
+                    "value": "2026-09-30"
                 }
             }
         ]
@@ -43,7 +43,7 @@ payload = {
 }
 
 # 保存 cif 文件的目录
-out_dir = Path("data/pdb_recent/mmcif_files")
+out_dir = Path("data/pdb_recent/sha_mmcif_files")
 out_dir.mkdir(parents=True, exist_ok=True)
 
 req = urllib.request.Request(
