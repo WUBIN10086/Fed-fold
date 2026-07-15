@@ -10,3 +10,6 @@ data
 openfold/resources/
 tests/test_data/
 cutlass/
+embeddings_output_dir/
+predictions/
+examples/monomer/fasta_dir/
