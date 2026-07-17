@@ -1,10 +1,14 @@
 ![header ](imgs/of_banner.png)
 _Figure: Comparison of OpenFold and AlphaFold2 predictions to the experimental structure of PDB 7KDX, chain B._
 
-# FedFold重写版文档
+# FedFold 重写版文档
 
-A faithful but trainable PyTorch reproduction of DeepMind's 
-[AlphaFold 2](https://github.com/deepmind/alphafold).
+FedFold 是一个面向蛋白质结构预测的联邦学习 SoloSeq 微调仓库，以 5 个 client
+本地微调、FedAvg 全局聚合和独立测试集评测为核心流程，支持从数据准备、pLDDT
+难样本筛选、train/test 划分到 TM-score 评测矩阵的完整实验闭环。
+
+本仓库主要参考了 [OpenFold](https://github.com/aqlaboratory/openfold) 和
+[AlphaFold 2](https://github.com/deepmind/alphafold)。
 
 # 三条路线：
 1. SoloSeq 路线：不依赖 MSA，直接做单序列训练
