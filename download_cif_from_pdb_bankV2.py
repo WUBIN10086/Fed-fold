@@ -8,16 +8,16 @@ from pathlib import Path
 # ============================================================
 # 可调参数(大作业建议先用这套"小而干净"的配置,最不容易训崩)
 # ============================================================
-DATE_START = "2025-07-01"   # 近一年起始(今天约 2026-07)
-DATE_END   = "2025-09-30"   # 近一年结束
+DATE_START = "2025-01-01"   # 近一年起始(今天约 2026-07)
+DATE_END   = "2026-07-01"   # 近一年结束
 RES_MAX    = 2.0            # 分辨率上限(Å),越小越干净
 LEN_MIN    = 30            # 序列长度下限,过滤太短的肽
 LEN_MAX    = 300           # 序列长度上限,省显存、防长序列训崩
-MAX_ENTRIES = 1000         # 最多下载多少条;设 None 表示全部下载
+MAX_ENTRIES = None         # 最多下载多少条;设 None 表示全部下载
 SLEEP_SEC   = 0.1          # 每次请求间隔,别把 RCSB 打太狠
 RETRY       = 3            # 单个文件下载失败重试次数
 
-out_dir = Path("data/sha_pdb_0703/sha_mmcif_files")
+out_dir = Path("data/all_pdb_1y/all_mmcif_files")
 out_dir.mkdir(parents=True, exist_ok=True)
 
 # ============================================================

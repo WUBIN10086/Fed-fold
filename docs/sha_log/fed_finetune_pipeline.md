@@ -14,13 +14,13 @@
 
 ## 0. 前置准备
 
-| 依赖 | 用途 | 检查方式 |
-|---|---|---|
-| Python 环境（OpenFold 依赖） | 运行所有脚本 | `python -c "import openfold"` |
-| `mmseqs` 可执行文件 | 序列聚类 | `which mmseqs` 有输出 |
-| ESM-1b 权重（可联网自动下载） | 生成 embedding | 首次运行 `torch.hub` 下载；离线见下方说明 |
-| SoloSeq 初始权重 `seq_model_esm1b_ptm.pt` | 预筛选预测 + 微调起点 | 位于 `openfold/resources/openfold_soloseq_params/`，缺失用 `scripts/download_openfold_soloseq_params.sh` 下载 |
-| `TMscore` 可执行文件 | 算 TM-score | 项目已带编译好的 `tmscore/TMscore` |
+| 依赖                                       | 用途                  | 检查方式                                                                                                         |
+| ------------------------------------------ | --------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| Python 环境（OpenFold 依赖）               | 运行所有脚本          | `python -c "import openfold"`                                                                                  |
+| `mmseqs` 可执行文件                      | 序列聚类              | `which mmseqs` 有输出                                                                                          |
+| ESM-1b 权重（可联网自动下载）              | 生成 embedding        | 首次运行`torch.hub` 下载；离线见下方说明                                                                       |
+| SoloSeq 初始权重`seq_model_esm1b_ptm.pt` | 预筛选预测 + 微调起点 | 位于`openfold/resources/openfold_soloseq_params/`，缺失用 `scripts/download_openfold_soloseq_params.sh` 下载 |
+| `TMscore` 可执行文件                     | 算 TM-score           | 项目已带编译好的`tmscore/TMscore`                                                                              |
 
 - 离线无法下载 ESM-1b：给 `precompute_embeddings.py` 传 `--use_local_esm <本地esm仓库路径>`。
 
@@ -63,7 +63,7 @@ python download_cif_from_pdb_bankV2.py
 ```
 
 - **作用**：按脚本内检索条件（近一年、X-ray、高分辨率、单蛋白单链、长度 30–300）从 RCSB 下载 `.cif`。
-- **产出**：`data/sha_pdb_0703/sha_mmcif_files/*.cif`、`data/sha_pdb_0703/entry_ids.txt`。
+- **产出**：`data/all_pdb_1y/all_mmcif_files/*.cif`、`data/all_pdb_1y/entry_ids.txt`。
 
 ---
 
@@ -73,38 +73,38 @@ python download_cif_from_pdb_bankV2.py
 
 ```bash
 python scripts/data_dir_to_fasta.py \
-    data/sha_pdb_0703/sha_mmcif_files/ \
-    data/sha_pdb_0703/sha_fasta_files/all.fasta
+    data/all_pdb_1y/all_mmcif_files/ \
+    data/all_pdb_1y/all_fasta_files/all.fasta
 ```
 
-- **产出**：`data/sha_pdb_0703/sha_fasta_files/all.fasta`（记录名 `>{PDBID}_{CHAIN}`）。
+- **产出**：`data/all_pdb_1y/all_fasta_files/all.fasta`（记录名 `>{PDBID}_{CHAIN}`）。
 
 ### 步骤 3 — 用 MMseqs2 按 30% identity 聚类去冗余
 
 ```bash
 python scripts/fasta_to_clusterfile.py \
-    data/sha_pdb_0703/sha_fasta_files/all.fasta \
-    data/sha_pdb_0703/clusters_30.txt \
+    data/all_pdb_1y/all_fasta_files/all.fasta \
+    data/all_pdb_1y/clusters_30.txt \
     $(which mmseqs) \
     --seq-id 0.3
 ```
 
-- **产出**：`data/sha_pdb_0703/clusters_30.txt`，每行一个 cluster。检查：`wc -l`。
-- **注意**：PowerShell 里把 `$(which mmseqs)` 换成绝对路径。
+- **产出**：`data/all_pdb_1y/clusters_30.txt`，每行一个 cluster。检查：`wc -l`。
+- **注意**：PowerShell 里把 `$(which mmseqs)` 换成绝对路径，注意要有mmseqs依赖，没有的话装一下，conda之类的。
 - **阈值说明**：本项目用 **30%**（聚类一物两用：分 client + 训练内均衡采样 + train/test 划分）。要对齐 RCSB 官方口径可改 `--seq-id 0.4`，但**整条流程必须共用同一个聚类文件**。
 
 ### 步骤 4 — 以 cluster 为单位均分给 5 个 client
 
 ```bash
 python scripts/split_clusters_to_clients.py \
-    data/sha_pdb_0703/clusters_30.txt \
-    data/sha_pdb_0703/sha_mmcif_files/ \
-    data/sha_pdb_0703/fed_split \
+    data/all_pdb_1y/clusters_30.txt \
+    data/all_pdb_1y/all_mmcif_files/ \
+    data/all_pdb_1y/fed_split \
     --num_clients 5
 ```
 
 - **作用**：以 cluster 为最小单位（同一 cluster 不跨 client，防泄漏），贪心均衡各 client 样本量。
-- **产出**：`data/sha_pdb_0703/fed_split/client_0..4/mmcif_files/`、`pdb_ids.txt`、`split_manifest.json`。
+- **产出**：`data/all_pdb_1y/fed_split/client_0..4/mmcif_files/`、`pdb_ids.txt`、`split_manifest.json`。
 - **检查**：`split_manifest.json` 里 `num_pdbs` 是否均衡、`cif_missing` 是否为空。磁盘紧张加 `--link`。
 
 > 阶段三～五是**每个 client 各跑一遍**（示例 `client_1`）。**5 个 client 都完成阶段三～五后**，再统一做阶段六的 train/test 划分。
@@ -117,8 +117,8 @@ python scripts/split_clusters_to_clients.py \
 
 ```bash
 python3 scripts/prep_solo_fasta_learnable.py \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_fasta_dir \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files/ \
+    data/all_pdb_1y/fed_split/client_1/solo_fasta_dir \
     --max_len 1022 \
     --dedup_by_sequence
 ```
@@ -129,8 +129,8 @@ python3 scripts/prep_solo_fasta_learnable.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python3 scripts/precompute_embeddings.py \
-    data/sha_pdb_0703/fed_split/client_1/solo_fasta_dir/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_alignment_dir
+    data/all_pdb_1y/fed_split/client_1/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_split/client_1/solo_alignment_dir
 ```
 
 - **产出**：`.../client_1/solo_alignment_dir/{label}/{label}.pt`（后续训练/预测全程复用）。离线加 `--use_local_esm <路径>`。
@@ -143,10 +143,10 @@ CUDA_VISIBLE_DEVICES=2 python3 scripts/precompute_embeddings.py \
 
 ```bash
 python3 run_pretrained_openfold.py \
-    data/sha_pdb_0703/fed_split/client_1/solo_fasta_dir/ \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files/ \
-    --use_precomputed_alignments data/sha_pdb_0703/fed_split/client_1/solo_alignment_dir/ \
-    --output_dir data/sha_pdb_0703/fed_split/client_1/pred_prescreen \
+    data/all_pdb_1y/fed_split/client_1/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files/ \
+    --use_precomputed_alignments data/all_pdb_1y/fed_split/client_1/solo_alignment_dir/ \
+    --output_dir data/all_pdb_1y/fed_split/client_1/pred_prescreen \
     --model_device "cuda:0" \
     --skip_relaxation \
     --config_preset "seq_model_esm1b_ptm" \
@@ -159,7 +159,7 @@ python3 run_pretrained_openfold.py \
 
 ```bash
 python3 scripts/plddt_from_pdb.py \
-    data/sha_pdb_0703/fed_split/client_1/pred_prescreen/ \
+    data/all_pdb_1y/fed_split/client_1/pred_prescreen/ \
     --selected-csv docs/selectedPDB/client_1_lowplddt.csv \
     --bad-log docs/selectedPDB/client_1_bad_pdb.txt \
     --no-extremes
@@ -172,8 +172,8 @@ python3 scripts/plddt_from_pdb.py \
 ```bash
 python3 scripts/extract_selected_mmcif.py \
     --csv-path docs/selectedPDB/client_1_lowplddt.csv \
-    --source-dir data/sha_pdb_0703/fed_split/client_1/mmcif_files \
-    --dst-dir data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune
+    --source-dir data/all_pdb_1y/fed_split/client_1/mmcif_files \
+    --dst-dir data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune
 ```
 
 - **产出**：`.../client_1/mmcif_files_finetune/*.cif`（微调数据来源子集）。
@@ -186,8 +186,8 @@ python3 scripts/extract_selected_mmcif.py \
 
 ```bash
 python3 scripts/prep_solo_fasta_learnable.py \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_fasta_dir_finetune \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/solo_fasta_dir_finetune \
     --max_len 1022 \
     --dedup_by_sequence
 ```
@@ -198,8 +198,8 @@ python3 scripts/prep_solo_fasta_learnable.py \
 
 ```bash
 python3 scripts/generate_mmcif_cache.py \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_mmcif_cache_finetune.json \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/solo_mmcif_cache_finetune.json \
     --no_workers 8
 ```
 
@@ -207,9 +207,9 @@ python3 scripts/generate_mmcif_cache.py \
 
 ```bash
 python3 scripts/generate_chain_data_cache.py \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_chain_data_cache_finetune.json \
-    --cluster_file data/sha_pdb_0703/clusters_30.txt \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/solo_chain_data_cache_finetune.json \
+    --cluster_file data/all_pdb_1y/clusters_30.txt \
     --no_workers 8
 ```
 
@@ -226,17 +226,17 @@ python3 scripts/generate_chain_data_cache.py \
 
 ```bash
 python3 scripts/build_fed_test_set.py \
-    --fed-split-dir data/sha_pdb_0703/fed_split \
+    --fed-split-dir data/all_pdb_1y/fed_split \
     --num-clients 5 \
-    --cluster-file data/sha_pdb_0703/clusters_30.txt \
-    --out-dir data/sha_pdb_0703/fed_test \
+    --cluster-file data/all_pdb_1y/clusters_30.txt \
+    --out-dir data/all_pdb_1y/fed_test \
     --test-frac 0.2 --seed 42
 ```
 
 - **作用**：对每个 client，把其低 pLDDT 候选池（步骤 10 的 `kept_labels.txt`）按整簇切成 train/test；再把所有 client 的 test 组装成一个**并集测试集**（后续每个模型只在并集上预测一次，即可切出「各自」与「全部」两种口径）。
 - **产出**：
-  - 每个 client：`data/sha_pdb_0703/fed_test/client_i/train_labels.txt`、`test_labels.txt`
-  - 并集：`data/sha_pdb_0703/fed_test/all/`，内含 `solo_fasta_dir/`、`solo_alignment_dir/`、`mmcif_files/`、`test_labels.txt`、`label_client_map.csv`
+  - 每个 client：`data/all_pdb_1y/fed_test/client_i/train_labels.txt`、`test_labels.txt`
+  - 并集：`data/all_pdb_1y/fed_test/all/`，内含 `solo_fasta_dir/`、`solo_alignment_dir/`、`mmcif_files/`、`test_labels.txt`、`label_client_map.csv`
 - **参数**：`--test-frac` 测试比例（默认 0.2）；embedding/cif 想省磁盘加 `--link` 用软链接。
 - **检查**：终端会打印每个 client 的 `候选/train/test` 数量以及并集链数；如有大量 `缺失项` 警告，多半是命名不一致（见开头纪律）。
 
@@ -248,19 +248,19 @@ python3 scripts/build_fed_test_set.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python3 train_openfold.py \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune/ \
-    data/sha_pdb_0703/fed_split/client_1/solo_alignment_dir/ \
-    data/sha_pdb_0703/fed_split/client_1/mmcif_files_finetune/ \
-    data/sha_pdb_0703/fed_split/client_1/output_dir \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/solo_alignment_dir/ \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/output_dir \
     2026-01-01 \
-    --train_filter_path data/sha_pdb_0703/fed_test/client_1/train_labels.txt \
+    --train_filter_path data/all_pdb_1y/fed_test/client_1/train_labels.txt \
     --use_single_seq_mode True \
     --config_preset seq_model_esm1b_ptm \
     --experiment_config_json seq_model_esm1b_ptm_finetune_override.json \
     --resume_from_ckpt openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt \
     --resume_model_weights_only True \
-    --template_release_dates_cache_path data/sha_pdb_0703/fed_split/client_1/solo_mmcif_cache_finetune.json \
-    --train_chain_data_cache_path data/sha_pdb_0703/fed_split/client_1/solo_chain_data_cache_finetune.json \
+    --template_release_dates_cache_path data/all_pdb_1y/fed_split/client_1/solo_mmcif_cache_finetune.json \
+    --train_chain_data_cache_path data/all_pdb_1y/fed_split/client_1/solo_chain_data_cache_finetune.json \
     --precision bf16-mixed \
     --gpus 1 \
     --deepspeed_config_path deepspeed_config.json
@@ -297,12 +297,12 @@ CUDA_VISIBLE_DEVICES=2 python3 train_openfold.py \
 ```bash
 python3 scripts/fedavg_aggregate.py \
     --checkpoints \
-        data/sha_pdb_0703/fed_split/client_0/output_dir/checkpoints/epoch=0-step=10000.ckpt \
-        data/sha_pdb_0703/fed_split/client_1/output_dir/checkpoints/epoch=0-step=10000.ckpt \
-        data/sha_pdb_0703/fed_split/client_2/output_dir/checkpoints/epoch=0-step=10000.ckpt \
-        data/sha_pdb_0703/fed_split/client_3/output_dir/checkpoints/epoch=0-step=10000.ckpt \
-        data/sha_pdb_0703/fed_split/client_4/output_dir/checkpoints/epoch=0-step=10000.ckpt \
-    --output data/sha_pdb_0703/fed_global/round1/global_model.pt
+        data/all_pdb_1y/fed_split/client_0/output_dir/checkpoints/epoch=0-step=10000.ckpt \
+        data/all_pdb_1y/fed_split/client_1/output_dir/checkpoints/epoch=0-step=10000.ckpt \
+        data/all_pdb_1y/fed_split/client_2/output_dir/checkpoints/epoch=0-step=10000.ckpt \
+        data/all_pdb_1y/fed_split/client_3/output_dir/checkpoints/epoch=0-step=10000.ckpt \
+        data/all_pdb_1y/fed_split/client_4/output_dir/checkpoints/epoch=0-step=10000.ckpt \
+    --output data/all_pdb_1y/fed_global/round1/global_model.pt
 ```
 
 - **作用**：提取每个 client 的 **EMA 参数**（与推理实际加载一致）做加权平均，输出 AlphaFold 层级纯参数 `.pt`（与官方 base 权重同构，既能当训练初始权重、也能直接推理）。
@@ -322,10 +322,10 @@ python3 scripts/fedavg_aggregate.py \
 
 ```bash
 python3 run_pretrained_openfold.py \
-    data/sha_pdb_0703/fed_test/all/solo_fasta_dir/ \
-    data/sha_pdb_0703/fed_test/all/mmcif_files/ \
-    --use_precomputed_alignments data/sha_pdb_0703/fed_test/all/solo_alignment_dir/ \
-    --output_dir data/sha_pdb_0703/fed_test/pred_before \
+    data/all_pdb_1y/fed_test/all/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_test/all/mmcif_files/ \
+    --use_precomputed_alignments data/all_pdb_1y/fed_test/all/solo_alignment_dir/ \
+    --output_dir data/all_pdb_1y/fed_test/pred_before \
     --model_device "cuda:0" --skip_relaxation --config_preset "seq_model_esm1b_ptm" \
     --openfold_checkpoint_path openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt
 ```
@@ -335,33 +335,33 @@ python3 run_pretrained_openfold.py \
 ```bash
 # 以 client_1 为例；client_0/2/3/4 同理，换 checkpoint 路径与 output_dir
 python3 run_pretrained_openfold.py \
-    data/sha_pdb_0703/fed_test/all/solo_fasta_dir/ \
-    data/sha_pdb_0703/fed_test/all/mmcif_files/ \
-    --use_precomputed_alignments data/sha_pdb_0703/fed_test/all/solo_alignment_dir/ \
-    --output_dir data/sha_pdb_0703/fed_test/pred_client_1_after \
+    data/all_pdb_1y/fed_test/all/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_test/all/mmcif_files/ \
+    --use_precomputed_alignments data/all_pdb_1y/fed_test/all/solo_alignment_dir/ \
+    --output_dir data/all_pdb_1y/fed_test/pred_client_1_after \
     --model_device "cuda:0" --skip_relaxation --config_preset "seq_model_esm1b_ptm" \
-    --openfold_checkpoint_path data/sha_pdb_0703/fed_split/client_1/output_dir/checkpoints/epoch=0-step=10000.ckpt
+    --openfold_checkpoint_path data/all_pdb_1y/fed_split/client_1/output_dir/checkpoints/epoch=0-step=10000.ckpt
 ```
 
 ### 步骤 18 — global（FedAvg）在并集测试集上预测
 
 ```bash
 python3 run_pretrained_openfold.py \
-    data/sha_pdb_0703/fed_test/all/solo_fasta_dir/ \
-    data/sha_pdb_0703/fed_test/all/mmcif_files/ \
-    --use_precomputed_alignments data/sha_pdb_0703/fed_test/all/solo_alignment_dir/ \
-    --output_dir data/sha_pdb_0703/fed_test/pred_global \
+    data/all_pdb_1y/fed_test/all/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_test/all/mmcif_files/ \
+    --use_precomputed_alignments data/all_pdb_1y/fed_test/all/solo_alignment_dir/ \
+    --output_dir data/all_pdb_1y/fed_test/pred_global \
     --model_device "cuda:0" --skip_relaxation --config_preset "seq_model_esm1b_ptm" \
-    --openfold_checkpoint_path data/sha_pdb_0703/fed_global/round1/global_model.pt
+    --openfold_checkpoint_path data/all_pdb_1y/fed_global/round1/global_model.pt
 ```
 
 ### 步骤 19 — 抽取并集测试集的 native（一次，所有模型共用）
 
 ```bash
 python3 scripts/extract_native_chain_pdbsV2.py \
-    --cif-dir data/sha_pdb_0703/fed_test/all/mmcif_files/ \
-    --out-dir data/sha_pdb_0703/fed_test/all/native \
-    --labels-txt data/sha_pdb_0703/fed_test/all/test_labels.txt
+    --cif-dir data/all_pdb_1y/fed_test/all/mmcif_files/ \
+    --out-dir data/all_pdb_1y/fed_test/all/native \
+    --labels-txt data/all_pdb_1y/fed_test/all/test_labels.txt
 ```
 
 - **作用**：坐标按 SEQRES 对齐、残基编号 `1..N`，与 SoloSeq 全长预测逐位对应。
@@ -370,33 +370,33 @@ python3 scripts/extract_native_chain_pdbsV2.py \
 
 ```bash
 # 对 7 个预测目录各跑一次；下面给 before / client_1_after / global 三个示例
-python3 scripts/tmscore_from_pdb.py data/sha_pdb_0703/fed_test/pred_before/ \
-    --native-dir data/sha_pdb_0703/fed_test/all/native/ --tm-exec tmscore/TMscore \
-    --out-csv data/sha_pdb_0703/fed_test/tm_before.csv
+python3 scripts/tmscore_from_pdb.py data/all_pdb_1y/fed_test/pred_before/ \
+    --native-dir data/all_pdb_1y/fed_test/all/native/ --tm-exec tmscore/TMscore \
+    --out-csv data/all_pdb_1y/fed_test/tm_before.csv
 
-python3 scripts/tmscore_from_pdb.py data/sha_pdb_0703/fed_test/pred_client_1_after/ \
-    --native-dir data/sha_pdb_0703/fed_test/all/native/ --tm-exec tmscore/TMscore \
-    --out-csv data/sha_pdb_0703/fed_test/tm_client_1_after.csv
+python3 scripts/tmscore_from_pdb.py data/all_pdb_1y/fed_test/pred_client_1_after/ \
+    --native-dir data/all_pdb_1y/fed_test/all/native/ --tm-exec tmscore/TMscore \
+    --out-csv data/all_pdb_1y/fed_test/tm_client_1_after.csv
 
-python3 scripts/tmscore_from_pdb.py data/sha_pdb_0703/fed_test/pred_global/ \
-    --native-dir data/sha_pdb_0703/fed_test/all/native/ --tm-exec tmscore/TMscore \
-    --out-csv data/sha_pdb_0703/fed_test/tm_global.csv
+python3 scripts/tmscore_from_pdb.py data/all_pdb_1y/fed_test/pred_global/ \
+    --native-dir data/all_pdb_1y/fed_test/all/native/ --tm-exec tmscore/TMscore \
+    --out-csv data/all_pdb_1y/fed_test/tm_global.csv
 ```
 
 ### 步骤 21 — 汇总成评测矩阵
 
 ```bash
 python3 scripts/eval_tm_matrix.py \
-    --label-map data/sha_pdb_0703/fed_test/all/label_client_map.csv \
+    --label-map data/all_pdb_1y/fed_test/all/label_client_map.csv \
     --scores \
-        before=data/sha_pdb_0703/fed_test/tm_before.csv \
-        client_0_after=data/sha_pdb_0703/fed_test/tm_client_0_after.csv \
-        client_1_after=data/sha_pdb_0703/fed_test/tm_client_1_after.csv \
-        client_2_after=data/sha_pdb_0703/fed_test/tm_client_2_after.csv \
-        client_3_after=data/sha_pdb_0703/fed_test/tm_client_3_after.csv \
-        client_4_after=data/sha_pdb_0703/fed_test/tm_client_4_after.csv \
-        global=data/sha_pdb_0703/fed_test/tm_global.csv \
-    --out-prefix data/sha_pdb_0703/fed_test/tm_matrix
+        before=data/all_pdb_1y/fed_test/tm_before.csv \
+        client_0_after=data/all_pdb_1y/fed_test/tm_client_0_after.csv \
+        client_1_after=data/all_pdb_1y/fed_test/tm_client_1_after.csv \
+        client_2_after=data/all_pdb_1y/fed_test/tm_client_2_after.csv \
+        client_3_after=data/all_pdb_1y/fed_test/tm_client_3_after.csv \
+        client_4_after=data/all_pdb_1y/fed_test/tm_client_4_after.csv \
+        global=data/all_pdb_1y/fed_test/tm_global.csv \
+    --out-prefix data/all_pdb_1y/fed_test/tm_matrix
 ```
 
 - **产出**：
@@ -405,13 +405,13 @@ python3 scripts/eval_tm_matrix.py \
 
 **怎么读这张矩阵**（正是你要的对比）：
 
-| 你想比较的 | 看矩阵里的 |
-|---|---|
-| client_i 微调前后（自己测试集）| 行 `before` vs 行 `client_i_after`，都取列 `client_i` |
-| client_i 微调前后（全部测试集）| 行 `before` vs 行 `client_i_after`，都取列 `all` |
-| 聚合后模型（各自 client 测试集）| 行 `global`，逐列看 `client_0..4` |
-| 聚合后模型（全部测试集）| 行 `global`，列 `all` |
-| 联邦 vs 单打独斗（泛化）| 同一列下，`global` vs 各 `client_i_after`；`client_i_after` 在 `client_j`(j≠i) 列即跨域泛化 |
+| 你想比较的                       | 看矩阵里的                                                                                           |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| client_i 微调前后（自己测试集）  | 行`before` vs 行 `client_i_after`，都取列 `client_i`                                           |
+| client_i 微调前后（全部测试集）  | 行`before` vs 行 `client_i_after`，都取列 `all`                                                |
+| 聚合后模型（各自 client 测试集） | 行`global`，逐列看 `client_0..4`                                                                 |
+| 聚合后模型（全部测试集）         | 行`global`，列 `all`                                                                             |
+| 联邦 vs 单打独斗（泛化）         | 同一列下，`global` vs 各 `client_i_after`；`client_i_after` 在 `client_j`(j≠i) 列即跨域泛化 |
 
 ### 评测口径统一（重要）
 
@@ -435,23 +435,23 @@ python3 scripts/eval_tm_matrix.py \
 
 ## 附：关键路径与产物速查
 
-| 步骤 | 主要产物 |
-|---|---|
-| 1 | `data/sha_pdb_0703/sha_mmcif_files/*.cif` |
-| 2 | `.../sha_fasta_files/all.fasta` |
-| 3 | `.../clusters_30.txt` |
-| 4 | `.../fed_split/client_*/`、`split_manifest.json` |
-| 5 | `.../client_1/solo_fasta_dir/`（全量 fasta）|
-| 6 | `.../client_1/solo_alignment_dir/{label}/{label}.pt`（全量 embedding）|
-| 7 | `.../client_1/pred_prescreen/*.pdb` |
-| 8 | `docs/selectedPDB/client_1_lowplddt.csv` |
-| 9 | `.../client_1/mmcif_files_finetune/*.cif` |
-| 10 | `.../client_1/solo_fasta_dir_finetune/_reports/kept_labels.txt`（划分候选池）|
-| 11/12 | `.../client_1/solo_mmcif_cache_finetune.json`、`solo_chain_data_cache_finetune.json` |
-| 13 | `.../fed_test/client_*/train_labels.txt`+`test_labels.txt`；`.../fed_test/all/`（fasta/emb/cif/test_labels/label_client_map）|
-| 14 | `.../client_1/output_dir/checkpoints/*.ckpt/`（每个 client 一份）|
-| 15 | `.../fed_global/round1/global_model.pt` |
-| 16/17/18 | `.../fed_test/pred_before/`、`pred_client_*_after/`、`pred_global/` |
-| 19 | `.../fed_test/all/native/{label}.pdb` |
-| 20 | `.../fed_test/tm_before.csv`、`tm_client_*_after.csv`、`tm_global.csv` |
-| 21 | `.../fed_test/tm_matrix_mean.csv`、`tm_matrix_long.csv` |
+| 步骤     | 主要产物                                                                                                                            |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| 1        | `data/all_pdb_1y/all_mmcif_files/*.cif`                                                                                           |
+| 2        | `.../all_fasta_files/all.fasta`                                                                                                   |
+| 3        | `.../clusters_30.txt`                                                                                                             |
+| 4        | `.../fed_split/client_*/`、`split_manifest.json`                                                                                |
+| 5        | `.../client_1/solo_fasta_dir/`（全量 fasta）                                                                                      |
+| 6        | `.../client_1/solo_alignment_dir/{label}/{label}.pt`（全量 embedding）                                                            |
+| 7        | `.../client_1/pred_prescreen/*.pdb`                                                                                               |
+| 8        | `docs/selectedPDB/client_1_lowplddt.csv`                                                                                          |
+| 9        | `.../client_1/mmcif_files_finetune/*.cif`                                                                                         |
+| 10       | `.../client_1/solo_fasta_dir_finetune/_reports/kept_labels.txt`（划分候选池）                                                     |
+| 11/12    | `.../client_1/solo_mmcif_cache_finetune.json`、`solo_chain_data_cache_finetune.json`                                            |
+| 13       | `.../fed_test/client_*/train_labels.txt`+`test_labels.txt`；`.../fed_test/all/`（fasta/emb/cif/test_labels/label_client_map） |
+| 14       | `.../client_1/output_dir/checkpoints/*.ckpt/`（每个 client 一份）                                                                 |
+| 15       | `.../fed_global/round1/global_model.pt`                                                                                           |
+| 16/17/18 | `.../fed_test/pred_before/`、`pred_client_*_after/`、`pred_global/`                                                           |
+| 19       | `.../fed_test/all/native/{label}.pdb`                                                                                             |
+| 20       | `.../fed_test/tm_before.csv`、`tm_client_*_after.csv`、`tm_global.csv`                                                        |
+| 21       | `.../fed_test/tm_matrix_mean.csv`、`tm_matrix_long.csv`                                                                         |

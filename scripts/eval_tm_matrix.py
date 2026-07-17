@@ -11,13 +11,13 @@
 
 用法：
   python scripts/eval_tm_matrix.py \
-      --label-map data/sha_pdb_0703/fed_test/all/label_client_map.csv \
+      --label-map data/all_pdb_1y/fed_test/all/label_client_map.csv \
       --scores \
-          before=data/sha_pdb_0703/fed_test/tm_before.csv \
-          client_0_after=data/sha_pdb_0703/fed_test/tm_client_0_after.csv \
-          client_1_after=data/sha_pdb_0703/fed_test/tm_client_1_after.csv \
-          global=data/sha_pdb_0703/fed_test/tm_global.csv \
-      --out-prefix data/sha_pdb_0703/fed_test/tm_matrix
+          before=data/all_pdb_1y/fed_test/tm_before.csv \
+          client_0_after=data/all_pdb_1y/fed_test/tm_client_0_after.csv \
+          client_1_after=data/all_pdb_1y/fed_test/tm_client_1_after.csv \
+          global=data/all_pdb_1y/fed_test/tm_global.csv \
+      --out-prefix data/all_pdb_1y/fed_test/tm_matrix
 """
 import argparse
 import csv

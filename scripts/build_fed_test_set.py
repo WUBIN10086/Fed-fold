@@ -17,10 +17,10 @@ kept_labels）按 **整个 cluster** 切成 train / test（同一 cluster 不跨
 
 用法：
   python scripts/build_fed_test_set.py \
-      --fed-split-dir data/sha_pdb_0703/fed_split \
+      --fed-split-dir data/all_pdb_1y/fed_split \
       --num-clients 5 \
-      --cluster-file data/sha_pdb_0703/clusters_30.txt \
-      --out-dir data/sha_pdb_0703/fed_test \
+      --cluster-file data/all_pdb_1y/clusters_30.txt \
+      --out-dir data/all_pdb_1y/fed_test \
       --test-frac 0.2 --seed 42
 """
 import argparse

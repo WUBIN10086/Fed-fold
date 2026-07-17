@@ -88,13 +88,13 @@ def main() -> None:
     parser.add_argument(
         "--source-dir",
         type=Path,
-        default=Path("data/pdb_recent/sha_mmcif_files"),
+        default=Path("data/all_pdb_1y/all_mmcif_files"),
         help="Directory containing original mmCIF files.",
     )
     parser.add_argument(
         "--dst-dir",
         type=Path,
-        default=Path("data/pdb_recent/selected_sha_mmcif_files"),
+        default=Path("data/all_pdb_1y/selected_mmcif_files"),
         help="Destination directory for copied files.",
     )
     parser.add_argument(

@@ -1,0 +1,9 @@
+input_dir: data/all_pdb_1y/fed_split/client_4/mmcif_files
+output_dir: data/all_pdb_1y/fed_split/client_4/solo_fasta_dir
+total_cif_files: 909
+kept_fasta_files: 390
+dropped_samples: 1159
+
+[dropped_reason_counts]
+duplicate_sequence: 1158
+x_ratio_too_high: 1

@@ -43,7 +43,7 @@ payload = {
 }
 
 # 保存 cif 文件的目录
-out_dir = Path("data/pdb_recent/sha_mmcif_files")
+out_dir = Path("data/all_pdb_1y/all_mmcif_files")
 out_dir.mkdir(parents=True, exist_ok=True)
 
 req = urllib.request.Request(

@@ -6,7 +6,21 @@ build
 dist
 
 # files from script downloads
-data
+data/*
+!data/all_pdb_1y/
+data/all_pdb_1y/*
+!data/all_pdb_1y/all_fasta_files/
+!data/all_pdb_1y/all_fasta_files/**
+!data/all_pdb_1y/fed_split/
+data/all_pdb_1y/fed_split/*
+!data/all_pdb_1y/fed_split/split_manifest.json
+!data/all_pdb_1y/fed_split/client_*/
+data/all_pdb_1y/fed_split/client_*/*
+!data/all_pdb_1y/fed_split/client_*/pdb_ids.txt
+!data/all_pdb_1y/fed_split/client_*/solo_fasta_dir/
+!data/all_pdb_1y/fed_split/client_*/solo_fasta_dir/**
+!data/all_pdb_1y/clusters_30.txt
+!data/all_pdb_1y/entry_ids.txt
 openfold/resources/
 tests/test_data/
 cutlass/
