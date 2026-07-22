@@ -1,21 +1,33 @@
 ![header ](imgs/of_banner.png)
 _Figure: Comparison of OpenFold and AlphaFold2 predictions to the experimental structure of PDB 7KDX, chain B._
 
-# FedFold重写版文档
+# FedFold 重写版文档
 
-A faithful but trainable PyTorch reproduction of DeepMind's 
-[AlphaFold 2](https://github.com/deepmind/alphafold).
+FedFold 是一个面向蛋白质结构预测的联邦学习 SoloSeq 微调仓库，以 5 个 client
+本地微调、FedAvg 全局聚合和独立测试集评测为核心流程，支持从数据准备、pLDDT
+难样本筛选、train/test 划分到 TM-score 评测矩阵的完整实验闭环。
 
-# 三条路线：
-1. SoloSeq 路线：不依赖 MSA，直接做单序列训练
-（[soloseq推理，训练，微调流程复现文档](docs/source/SoloSeq_Reasoning_Train_Finetune_Repro.md)）
-2. 标准 OpenFold 路线：自己生成 MSA（DeepMind 方法）
-3. 直接用 RODA 数据：最快进入训练状态的大规模路线
+本仓库主要参考了 [OpenFold](https://github.com/aqlaboratory/openfold) 和
+[AlphaFold 2](https://github.com/deepmind/alphafold)。
 
-# 任务分配
-[请查看文档](docs/source/数据筛选.md)
+# 使用方法：
+
+请参考Sha_log[pipeline](docs/sha_log/fed_finetune_pipeline.md)
+
+# 任务进度：
+## WU:
+1. 下载了从2025-01-01到2026-07-01的数据(符合结构的总数4334)
+2. 修改了一下data下载的文件夹名字，对应需要修改的路径也一起改了(一年的数据在data/all_pdb_1y)
+3. data_dir_to_fasta脚本进行了修改，避免一次写入(我的内存不够ORZ)
+4. 数据聚类划分已提交，5个client，mmcif文件没有上传，上传了处理好的fasta序列。可以按照姓氏排名分配：
++ He -> client 0
++ HU -> client 1
++ Sha -> client 2
++ Wu -> client 3
++ Wang -> client 4
 
 # openfold原始文档引导
+
 See our new home for docs at [openfold.readthedocs.io](https://openfold.readthedocs.io/en/latest/), with instructions for installation and model inference/training.
 
 Much of the content from this page may be found [here.](https://github.com/aqlaboratory/openfold/blob/main/docs/source/original_readme.md)
@@ -23,8 +35,8 @@ Much of the content from this page may be found [here.](https://github.com/aqlab
 ## Copyright Notice
 
 While AlphaFold's and, by extension, OpenFold's source code is licensed under
-the permissive Apache Licence, Version 2.0, DeepMind's pretrained parameters 
-fall under the CC BY 4.0 license, a copy of which is downloaded to 
+the permissive Apache Licence, Version 2.0, DeepMind's pretrained parameters
+fall under the CC BY 4.0 license, a copy of which is downloaded to
 `openfold/resources/params` by the installation script. Note that the latter
 replaces the original, more restrictive CC BY-NC 4.0 license as of January 2022.
 
@@ -50,6 +62,7 @@ Please cite our paper:
 	journal = {bioRxiv}
 }
 ```
+
 If you use OpenProteinSet, please also cite:
 
 ```bibtex
@@ -62,4 +75,5 @@ If you use OpenProteinSet, please also cite:
       primaryClass={q-bio.BM}
 }
 ```
+
 Any work that cites OpenFold should also cite [AlphaFold](https://www.nature.com/articles/s41586-021-03819-2) and [AlphaFold-Multimer](https://www.biorxiv.org/content/10.1101/2021.10.04.463034v1) if applicable.

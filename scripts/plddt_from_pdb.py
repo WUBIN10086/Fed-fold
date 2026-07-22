@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import csv
-target_csv_dir = "./data/pdb_recent/sequence_plddt_lower_than_80.csv"
+NAME_SUFFIX_TO_STRIP = "_seq_model_esm1b_ptm_unrelaxed"
+
 
 @dataclass(frozen=True)
 class ResidueKey:
@@ -137,7 +138,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Summarize pLDDT from a PDB where pLDDT is stored in the B-factor column.",
     )
-    parser.add_argument("pdb", nargs="+", type=Path, help="Input PDB file(s)")
+    parser.add_argument("pdb", nargs="+", type=Path, help="Input PDB file(s) and/or directories")
     parser.add_argument("-a", "--atom", default="CA", help="Atom name to use per residue (default: CA)")
     parser.add_argument("--include-icode", action="store_true", help="Include insertion code in residue key")
     parser.add_argument(
@@ -149,21 +150,62 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("-b", "--bottom", type=int, default=10, help="Show lowest N residues (default: 10)")
     parser.add_argument("-t", "--top", type=int, default=10, help="Show highest N residues (default: 10)")
     parser.add_argument("--no-extremes", action="store_true", help="Do not print lowest/highest tables")
+    parser.add_argument(
+        "--select-threshold",
+        type=float,
+        default=80.0,
+        help="Select proteins with mean pLDDT below this threshold (default: 80.0)",
+    )
+    parser.add_argument(
+        "--selected-csv",
+        type=Path,
+        default=Path("docs/selectedPDB/SHA.csv"),
+        help="CSV output path for selected proteins (default: docs/selectedPDB/SHA.csv)",
+    )
+    parser.add_argument(
+        "--bad-log",
+        type=Path,
+        default=Path("docs/selectedPDB/SHA_bad_pdb.txt"),
+        help="Log path for skipped empty/bad-format files (default: docs/selectedPDB/SHA_bad_pdb.txt)",
+    )
 
     args = parser.parse_args(argv)
 
-    for pdb_path in args.pdb:
-        if not pdb_path.is_file():
-            raise SystemExit(f"File not found: {pdb_path}")
+    pdb_files: List[Path] = []
+    for inp in args.pdb:
+        if inp.is_file():
+            pdb_files.append(inp)
+        elif inp.is_dir():
+            pdb_files.extend(sorted(inp.rglob("*.pdb")))
+        else:
+            raise SystemExit(f"File/Directory not found: {inp}")
 
-        items = list(
-            iter_residue_plddt(
-                pdb_path,
-                atom_name=args.atom,
-                include_icode=args.include_icode,
-                dedupe=args.dedupe,
+    if not pdb_files:
+        raise SystemExit("No PDB files found.")
+
+    selected: List[Tuple[str, float]] = []
+    bad_files: List[Tuple[Path, str]] = []
+
+    for pdb_path in pdb_files:
+        try:
+            items = list(
+                iter_residue_plddt(
+                    pdb_path,
+                    atom_name=args.atom,
+                    include_icode=args.include_icode,
+                    dedupe=args.dedupe,
+                )
             )
-        )
+        except Exception as e:
+            bad_files.append((pdb_path, f"read/parse error: {e}"))
+            print(f"[SKIP] {pdb_path} -> read/parse error: {e}")
+            continue
+
+        if not items:
+            bad_files.append((pdb_path, "no residues found (atom selection or PDB formatting issue)"))
+            print(f"[SKIP] {pdb_path} -> no residues found")
+            continue
+
         summary = summarize_plddt(items)
 
         print(f"File: {pdb_path}")
@@ -173,15 +215,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"min\t{summary.min:.2f}")
         print(f"max\t{summary.max:.2f}")
         print()
-
-        # write the sequence id and pLDDT into the csv file
-        if summary.mean < 80:
-            with open(target_csv_dir, 'a', newline='') as csvfile:
-                filename = str(pdb_path).split('/')[-1]        # "7GR2_A_seq_model_esm1b_ptm_unrelaxed.pdb"
-                parts = filename.split('_')
-                seq_name = f"{parts[0]}_{parts[1]}"   # "7GR2_A"
-                writer = csv.writer(csvfile)
-                writer.writerow([seq_name, f"{summary.mean:.2f}"])
 
         print("== Bins ==")
         for k in ("<50", "50-70", "70-90", ">=90"):
@@ -218,6 +251,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"{k.chain_id}\t{_fmt_res(k)}\t{s:.2f}")
 
         print()
+
+        mean_score = summary.mean
+        if mean_score < args.select_threshold:
+            protein_name = pdb_path.stem
+            if protein_name.endswith(NAME_SUFFIX_TO_STRIP):
+                protein_name = protein_name[: -len(NAME_SUFFIX_TO_STRIP)]
+            selected.append((protein_name, mean_score))
+
+    args.selected_csv.parent.mkdir(parents=True, exist_ok=True)
+    with args.selected_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["protein_name", "mean_plddt"])
+        for protein_name, mean_score in sorted(selected, key=lambda x: x[1]):
+            writer.writerow([protein_name, f"{mean_score:.2f}"])
+
+    args.bad_log.parent.mkdir(parents=True, exist_ok=True)
+    with args.bad_log.open("w", encoding="utf-8") as f:
+        f.write("pdb_path\treason\n")
+        for pdb_path, reason in bad_files:
+            f.write(f"{pdb_path}\t{reason}\n")
+
+    print(
+        f"Wrote {len(selected)} proteins with mean pLDDT < {args.select_threshold:.2f} "
+        f"to {args.selected_csv}"
+    )
+    print(f"Wrote {len(bad_files)} skipped files to {args.bad_log}")
 
     return 0
 

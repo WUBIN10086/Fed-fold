@@ -120,15 +120,34 @@ class EmbeddingGenerator:
         )
         logging.info("Loaded all sequences")
         repr_layers = [33]
+        max_residue_len = 1022
+        skipped_labels = []
 
         with torch.no_grad():
             for batch_idx, (labels, strs, toks) in enumerate(data_loader):
                 logging.info(f"Processing {batch_idx + 1} of {len(batches)} batches ({toks.size(0)} sequences)")
+                keep_indices = []
+                for i, (label, seq) in enumerate(zip(labels, strs)):
+                    if len(seq) > max_residue_len:
+                        logging.warning(
+                            f"Skipping sequence {label}: length {len(seq)} is above ESM-1b limit ({max_residue_len})"
+                        )
+                        skipped_labels.append(label)
+                    else:
+                        keep_indices.append(i)
+
+                if len(keep_indices) == 0:
+                    continue
+
+                labels = [labels[i] for i in keep_indices]
+                strs = [strs[i] for i in keep_indices]
+                toks = toks[keep_indices]
+
                 if torch.cuda.is_available() and not self.nogpu:
                     toks = toks.to(device="cuda", non_blocking=True)
-                
+
                 if self.truncate:
-                    toks = toks[:1022]
+                    toks = toks[:, : max_residue_len + 2]
                 
                 out = self.model(toks, repr_layers=repr_layers, return_contacts=False)
 
@@ -148,6 +167,8 @@ class EmbeddingGenerator:
                         os.path.join(output_dir, label, label+".pt")
                     )
         
+        return skipped_labels
+        
         
 
 def main(args):
@@ -162,11 +183,17 @@ def main(args):
         args.fasta_dir,
         args.output_dir
     )
-    embedding_generator.run(
+    skipped_labels = embedding_generator.run(
         temp_fasta_file,
         args.output_dir
     )
+    skipped_file = os.path.join(args.output_dir, "skipped_sequences.txt")
+    with open(skipped_file, "w") as outfile:
+        for label in skipped_labels:
+            outfile.write(f"{label}\n")
+
     os.remove(temp_fasta_file)
+    logging.info(f"Skipped {len(skipped_labels)} sequences. List saved to {skipped_file}")
     logging.info("Completed.")
 
 

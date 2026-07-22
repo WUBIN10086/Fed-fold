@@ -1,0 +1,37 @@
+{
+  "client_0": {
+    "num_clusters": 185,
+    "num_chains": 1550,
+    "num_pdbs": 870,
+    "cif_copied": 870,
+    "cif_missing": []
+  },
+  "client_1": {
+    "num_clusters": 185,
+    "num_chains": 1550,
+    "num_pdbs": 730,
+    "cif_copied": 730,
+    "cif_missing": []
+  },
+  "client_2": {
+    "num_clusters": 189,
+    "num_chains": 1550,
+    "num_pdbs": 1007,
+    "cif_copied": 1007,
+    "cif_missing": []
+  },
+  "client_3": {
+    "num_clusters": 190,
+    "num_chains": 1550,
+    "num_pdbs": 818,
+    "cif_copied": 818,
+    "cif_missing": []
+  },
+  "client_4": {
+    "num_clusters": 189,
+    "num_chains": 1549,
+    "num_pdbs": 909,
+    "cif_copied": 909,
+    "cif_missing": []
+  }
+}
