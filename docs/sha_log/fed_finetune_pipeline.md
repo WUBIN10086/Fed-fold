@@ -275,6 +275,93 @@ CUDA_VISIBLE_DEVICES=2 python3 train_openfold.py \
 > **停止策略（二选一）**：默认按 `--train_epoch_len`（默认 10000，约 10000 step）。想用 epoch/早停加 `--max_epochs 3 --checkpoint_every_epoch`；要早停再加 `--early_stopping True`（它监控 `val/lddt_ca`，须同时配置下方验证集）。
 > ⚠️ 集中式方案的 `--val_check_interval` 在本仓库**不是有效参数**，请勿照抄。
 
+### 步骤 14a — client1 小样本 LoRA 微调（推荐实验）
+
+client1 只有 64 条训练样本。全参数微调会更新约 7530 万参数，当前 1–4 epoch 的测试 TM-score 均未超过未微调基线。可先用原生 LoRA 只更新 Structure Module 的低秩 adapter：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 train_openfold.py \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/solo_alignment/ \
+    data/all_pdb_1y/fed_split/client_1/mmcif_files_finetune/ \
+    data/all_pdb_1y/fed_split/client_1/output_lora_r4 \
+    2026-01-01 \
+    --train_filter_path data/all_pdb_1y/fed_test/client_1/train_labels.txt \
+    --use_single_seq_mode True \
+    --config_preset seq_model_esm1b_ptm \
+    --experiment_config_json seq_model_esm1b_ptm_finetune_override.json \
+    --resume_from_ckpt openfold/resources/openfold_soloseq_params/seq_model_esm1b_ptm.pt \
+    --resume_model_weights_only True \
+    --template_release_dates_cache_path data/all_pdb_1y/fed_split/client_1/solo_mmcif_cache_finetune.json \
+    --train_chain_data_cache_path data/all_pdb_1y/fed_split/client_1/solo_chain_data_cache_finetune.json \
+    --lora_rank 4 \
+    --lora_alpha 8 \
+    --lora_dropout 0.05 \
+    --lora_target structure_module \
+    --learning_rate 1e-4 \
+    --lr_warmup_steps 20 \
+    --accumulate_grad_batches 1 \
+    --train_epoch_len 64 \
+    --max_epochs 3 \
+    --checkpoint_every_epoch \
+    --precision bf16-mixed \
+    --gpus 1 \
+    --seed 42 \
+    --deepspeed_config_path deepspeed_config.json
+```
+
+在 `seq_model_esm1b_ptm` 上，上述配置实际匹配 Structure Module 的 18 个 OpenFold `Linear`，新增并训练 43,904 个 adapter 参数，占含 LoRA 模型 75,333,722 个参数的 0.058279%。训练启动日志会列出完整模块名并重新统计。`rank=0` 完全关闭 LoRA 并保持普通训练。LoRA 暂不支持 `--script_modules True`。
+
+每个 epoch 都分别导出 EMA 和 raw model 的 merged 权重。EMA 是正式推理口径；raw model 用来观察 decay=0.999 在短训练中是否掩盖 adapter 更新：
+
+```bash
+mkdir -p data/all_pdb_1y/fed_split/client_1/output_lora_r4/merged
+
+for CKPT in 0-64 1-128 2-192; do
+    python3 scripts/export_lora_checkpoint.py \
+        --input data/all_pdb_1y/fed_split/client_1/output_lora_r4/checkpoints/${CKPT}.ckpt \
+        --output data/all_pdb_1y/fed_split/client_1/output_lora_r4/merged/${CKPT}_ema.pt \
+        --weights-source ema \
+        --config-preset seq_model_esm1b_ptm
+
+    python3 scripts/export_lora_checkpoint.py \
+        --input data/all_pdb_1y/fed_split/client_1/output_lora_r4/checkpoints/${CKPT}.ckpt \
+        --output data/all_pdb_1y/fed_split/client_1/output_lora_r4/merged/${CKPT}_model.pt \
+        --weights-source model \
+        --config-preset seq_model_esm1b_ptm
+done
+```
+
+merged `.pt` 不含 `lora_A/lora_B`，键结构与普通 AlphaFold 权重一致，可直接推理。以下以 epoch 1 EMA 为例，只对固定的 client1 20 条测试集运行：
+
+```bash
+python3 run_pretrained_openfold.py \
+    data/all_pdb_1y/fed_test/all/solo_fasta_dir/ \
+    data/all_pdb_1y/fed_test/all/mmcif_files/ \
+    --use_precomputed_alignments data/all_pdb_1y/fed_test/all/solo_alignment_dir/ \
+    --output_dir data/all_pdb_1y/fed_test/lora_r4_epoch1_ema \
+    --model_device "cuda:0" --skip_relaxation \
+    --config_preset seq_model_esm1b_ptm \
+    --openfold_checkpoint_path \
+      data/all_pdb_1y/fed_split/client_1/output_lora_r4/merged/0-64_ema.pt
+
+python3 scripts/tmscore_from_pdb.py \
+    data/all_pdb_1y/fed_test/lora_r4_epoch1_ema/predictions/ \
+    --native-dir data/all_pdb_1y/fed_test/all/native/ \
+    --tm-exec tmscore/TMscore \
+    --out-csv data/all_pdb_1y/fed_test/lora_r4_epoch1_ema_tm.csv
+
+python3 scripts/plddt_from_pdb.py \
+    data/all_pdb_1y/fed_test/lora_r4_epoch1_ema/predictions/ \
+    --no-extremes --select-threshold 101 \
+    --selected-csv data/all_pdb_1y/fed_test/lora_r4_epoch1_ema_plddt.csv \
+    --bad-log data/all_pdb_1y/fed_test/lora_r4_epoch1_ema_bad.txt
+```
+
+选择 checkpoint 时不能只看训练 loss，也不能反复用正式 20 条测试集调参。应从 client1 的 train cluster 中另划独立验证集，按验证 TM-score 选 epoch，最终只在固定 test 上报告一次。LoRA 只能缓解小数据全参数更新导致的遗忘，不能解决“按低 pLDDT 选样本、却用 TM-score 判断效果”的目标错配，因此不保证超过 baseline。
+
+当前 FedAvg 先聚合各 client 的 merged `.pt`。若以后只聚合 adapter，所有 client 必须共享完全相同的 base checkpoint、LoRA target/rank/alpha 和 adapter 初始化。
+
 ### （可选）步骤 14b — 训练中用验证集监控真实精度
 
 本仓库支持 `--val_data_dir / --val_alignment_dir / --val_mmcif_data_cache_path / --num_sanity_val_steps`。你可以从 `train_labels.txt` 里再切一小部分做验证（同样按整簇），用 `extract_selected_mmcif.py` + `generate_mmcif_cache.py` 搭出 `val_mmcif_files/` 与 `val_mmcif_cache.json`（embedding 复用全量 `solo_alignment_dir`），然后在步骤 14 追加：

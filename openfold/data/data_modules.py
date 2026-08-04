@@ -1,4 +1,5 @@
 import copy
+from collections import Counter
 from functools import partial
 import json
 import logging
@@ -21,6 +22,40 @@ from openfold.utils.tensor_utils import dict_multimap
 from openfold.utils.tensor_utils import (
     tensor_tree_map,
 )
+
+
+def load_sampling_clusters(path):
+    mapping = {}
+    if path is None:
+        return mapping
+    with open(path, "r", encoding="utf-8") as handle:
+        for cluster_id, line in enumerate(handle):
+            for label in line.split():
+                mapping[label.upper()] = str(cluster_id)
+    return mapping
+
+
+def compute_sampling_audit(labels, label_to_cluster):
+    labels = [str(label) for label in labels]
+    clusters = [
+        label_to_cluster.get(label.upper(), f"singleton:{label.upper()}")
+        for label in labels
+    ]
+    cluster_counts = Counter(clusters)
+    denominator = sum(count * count for count in cluster_counts.values())
+    ess = (
+        (len(labels) ** 2) / denominator
+        if denominator
+        else 0.0
+    )
+    return {
+        "draw_count": len(labels),
+        "unique_label_count": len(set(labels)),
+        "unique_cluster_count": len(cluster_counts),
+        "cluster_frequencies": dict(sorted(cluster_counts.items())),
+        "cluster_sampling_ess": ess,
+        "train_epoch_len_semantics": "random_draw_count_not_dataset_pass",
+    }
 
 
 class OpenFoldSingleDataset(torch.utils.data.Dataset):
@@ -867,6 +902,8 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  template_release_dates_cache_path: Optional[str] = None,
                  batch_seed: Optional[int] = None,
                  train_epoch_len: int = 50000,
+                 sampling_audit_path: Optional[str] = None,
+                 sampling_cluster_file: Optional[str] = None,
                  _distillation_structure_index_path: Optional[str] = None,
                  alignment_index_path: Optional[str] = None,
                  distillation_alignment_index_path: Optional[str] = None,
@@ -898,6 +935,11 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.obsolete_pdbs_file_path = obsolete_pdbs_file_path
         self.batch_seed = batch_seed
         self.train_epoch_len = train_epoch_len
+        self.sampling_audit_path = sampling_audit_path
+        self.sampling_label_to_cluster = load_sampling_clusters(
+            sampling_cluster_file
+        )
+        self._sampling_audit_epoch = 0
 
         if self.train_data_dir is None and self.predict_data_dir is None:
             raise ValueError(
@@ -1026,6 +1068,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
             dataset = self.train_dataset
             # Filter the dataset, if necessary
             dataset.reroll()
+            self._write_sampling_audit(dataset)
         elif stage == "eval":
             dataset = self.eval_dataset
         elif stage == "predict":
@@ -1046,6 +1089,29 @@ class OpenFoldDataModule(pl.LightningDataModule):
         )
 
         return dl
+
+    def _write_sampling_audit(self, dataset):
+        if self.sampling_audit_path is None:
+            return
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None and getattr(trainer, "global_rank", 0) != 0:
+            return
+        labels = [
+            dataset.datasets[int(dataset_idx)].idx_to_chain_id(
+                int(datapoint_idx)
+            )
+            for dataset_idx, datapoint_idx in dataset.datapoints
+        ]
+        audit = compute_sampling_audit(
+            labels,
+            self.sampling_label_to_cluster,
+        )
+        audit["epoch_index"] = self._sampling_audit_epoch
+        self._sampling_audit_epoch += 1
+        path = os.path.abspath(self.sampling_audit_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(audit, sort_keys=True) + "\n")
 
     def train_dataloader(self):
         return self._gen_dataloader("train")

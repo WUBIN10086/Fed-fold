@@ -292,7 +292,9 @@ def main(args):
         args.model_device,
         args.openfold_checkpoint_path,
         args.jax_param_path,
-        args.output_dir)
+        args.output_dir,
+        args.checkpoint_weights_source,
+    )
 
     for model, output_directory in model_generator:
         cur_tracing_interval = 0
@@ -439,6 +441,15 @@ if __name__ == "__main__":
         "--openfold_checkpoint_path", type=str, default=None,
         help="""Path to OpenFold checkpoint. Can be either a DeepSpeed 
              checkpoint directory or a .pt file"""
+    )
+    parser.add_argument(
+        "--checkpoint_weights_source",
+        choices=("ema", "module", "state_dict", "auto"),
+        default="auto",
+        help=(
+            "OpenFold checkpoint weight source. auto uses EMA for wrapped "
+            "public checkpoints and directly loads plain merged state dicts."
+        ),
     )
     parser.add_argument(
         "--save_outputs", action="store_true", default=False,

@@ -21,13 +21,25 @@ import torch
 import torch.nn as nn
 from scipy.stats import truncnorm
 
-deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
-ds4s_is_installed = deepspeed_is_installed and importlib.util.find_spec("deepspeed.ops.deepspeed4science") is not None
-if deepspeed_is_installed:
-    import deepspeed
-
-if ds4s_is_installed:
-    from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
+deepspeed = None
+deepspeed_is_installed = False
+ds4s_is_installed = False
+try:
+    if importlib.util.find_spec("deepspeed") is not None:
+        import deepspeed
+        deepspeed_is_installed = True
+        try:
+            from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
+            ds4s_is_installed = True
+        except (ImportError, ModuleNotFoundError):
+            pass
+except Exception:
+    # DeepSpeed is optional for model primitives. Some installations raise
+    # during import when no CUDA toolkit is available; plain CPU OpenFold and
+    # unit tests must remain usable in that case.
+    deepspeed = None
+    deepspeed_is_installed = False
+    ds4s_is_installed = False
 
 fa_is_installed = importlib.util.find_spec("flash_attn") is not None
 if fa_is_installed:

@@ -14,9 +14,16 @@
 import importlib
 from typing import Any, Tuple, List, Callable, Optional
 
-deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
-if(deepspeed_is_installed):
-    import deepspeed
+deepspeed = None
+deepspeed_is_installed = False
+try:
+    if importlib.util.find_spec("deepspeed") is not None:
+        import deepspeed
+        deepspeed_is_installed = True
+except Exception:
+    # DeepSpeed is optional. A package can be present but unusable without a
+    # CUDA toolkit; fall back to native torch checkpointing in that case.
+    deepspeed = None
 
 import torch
 import torch.utils.checkpoint

@@ -25,8 +25,16 @@ from openfold.utils.callbacks import (
     EarlyStoppingVerbose,
 )
 from openfold.utils.exponential_moving_average import ExponentialMovingAverage
+from openfold.utils.lora import (
+    LoRAConfig,
+    configure_lora,
+    parameter_counts,
+)
 from openfold.utils.loss import AlphaFoldLoss, lddt_ca
-from openfold.utils.lr_schedulers import AlphaFoldLRScheduler
+from openfold.utils.lr_schedulers import (
+    AlphaFoldLRScheduler,
+    compute_alphafold_learning_rate,
+)
 from openfold.utils.multi_chain_permutation import multi_chain_permutation_align
 from openfold.utils.superimposition import superimpose
 from openfold.utils.tensor_utils import tensor_tree_map
@@ -40,14 +48,27 @@ from openfold.utils.import_weights import (
     import_openfold_weights_
 )
 from openfold.utils.logger import PerformanceLoggingCallback
+from openfold.utils.training_utils import (
+    DEFAULT_INIT_WEIGHTS_SOURCE,
+    build_trainer_kwargs,
+    extract_alphafold_weights,
+    log_ignored_trainer_args,
+    reset_ema_from_model,
+    resolve_learning_rate,
+    resolve_lora_config,
+    should_reset_ema,
+    validate_lora_runtime,
+)
 
 
 class OpenFoldWrapper(pl.LightningModule):
-    def __init__(self, config):
+    def __init__(self, config, training_config=None, lora_config=None):
         super(OpenFoldWrapper, self).__init__()
         self.config = config
         self.model = AlphaFold(config)
         self.is_multimer = self.config.globals.is_multimer
+        self.training_config = training_config or {}
+        self.lora_config = lora_config or LoRAConfig()
 
         self.loss = AlphaFoldLoss(config.loss)
 
@@ -214,13 +235,18 @@ class OpenFoldWrapper(pl.LightningModule):
 
         return metrics
 
-    def configure_optimizers(self, 
-        learning_rate: float = 1e-3,
-        eps: float = 1e-5,
-    ) -> torch.optim.Adam:
+    def configure_optimizers(self) -> torch.optim.Adam:
+        learning_rate = self.training_config.get("learning_rate", 1e-3)
+        eps = self.training_config.get("optimizer_eps", 1e-5)
+        trainable_parameters = [
+            parameter for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise ValueError("Model has no trainable parameters")
         # Ignored as long as a DeepSpeed optimizer is configured
         optimizer = torch.optim.Adam(
-            self.model.parameters(),
+            trainable_parameters,
             lr=learning_rate,
             eps=eps
         )
@@ -232,7 +258,17 @@ class OpenFoldWrapper(pl.LightningModule):
 
         lr_scheduler = AlphaFoldLRScheduler(
             optimizer,
-            last_epoch=self.last_lr_step
+            last_epoch=self.last_lr_step,
+            base_lr=self.training_config.get("lr_base", 0.0),
+            max_lr=learning_rate,
+            warmup_no_steps=self.training_config.get("lr_warmup_steps", 1000),
+            start_decay_after_n_steps=self.training_config.get(
+                "lr_start_decay_after_steps", 50000
+            ),
+            decay_every_n_steps=self.training_config.get(
+                "lr_decay_every_steps", 50000
+            ),
+            decay_factor=self.training_config.get("lr_decay_factor", 0.95),
         )
 
         return {
@@ -245,14 +281,34 @@ class OpenFoldWrapper(pl.LightningModule):
         }
 
     def on_load_checkpoint(self, checkpoint):
+        checkpoint_lora_config = checkpoint.get("lora_config")
+        if checkpoint_lora_config is not None:
+            restored = LoRAConfig.from_dict(checkpoint_lora_config)
+            if restored != self.lora_config:
+                raise ValueError(
+                    "Checkpoint LoRA configuration does not match model: "
+                    f"checkpoint={restored}, model={self.lora_config}"
+                )
+        elif self.lora_config.enabled:
+            raise ValueError("LoRA checkpoint is missing lora_config")
+
         ema = checkpoint["ema"]
         if (not self.model.template_config.enabled):
             ema["params"] = {k: v for k,
                              v in ema["params"].items() if not "template" in k}
+        expected_ema_keys = set(self.model.state_dict())
+        actual_ema_keys = set(ema["params"])
+        if expected_ema_keys != actual_ema_keys:
+            raise ValueError(
+                "Checkpoint EMA keys do not match the model; "
+                f"missing={sorted(expected_ema_keys - actual_ema_keys)[:5]}, "
+                f"extra={sorted(actual_ema_keys - expected_ema_keys)[:5]}"
+            )
         self.ema.load_state_dict(ema)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["ema"] = self.ema.state_dict()
+        checkpoint["lora_config"] = self.lora_config.to_dict()
 
     def resume_last_lr_step(self, lr_step):
         self.last_lr_step = lr_step
@@ -279,7 +335,16 @@ def get_model_state_dict_from_ds_checkpoint(checkpoint_dir):
     ds_checkpoint_dir = os.path.join(checkpoint_dir, tag)
     _DS_CHECKPOINT_VERSION = 2  # based on manual parsing of checkpoint files
     state_file = zero_to_fp32.get_model_state_file(ds_checkpoint_dir, _DS_CHECKPOINT_VERSION)
-    return torch.load(state_file)
+    # DeepSpeed model-state files contain trusted Lightning/OpenFold metadata
+    # in addition to tensors, so PyTorch's weights-only loader cannot read them.
+    return torch.load(state_file, weights_only=False)
+
+
+def load_checkpoint_metadata(checkpoint_path):
+    if os.path.isdir(checkpoint_path):
+        return get_model_state_dict_from_ds_checkpoint(checkpoint_path)
+    return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
 
 def main(args):
     if(args.seed is not None):
@@ -298,42 +363,138 @@ def main(args):
             custom_config_dict = json.load(f)
         config.update_from_flattened_dict(custom_config_dict)
 
-    model_module = OpenFoldWrapper(config)
+    full_checkpoint_resume = (
+        args.resume_from_ckpt is not None
+        and not args.resume_model_weights_only
+    )
+    checkpoint_metadata = (
+        load_checkpoint_metadata(args.resume_from_ckpt)
+        if args.resume_from_ckpt is not None
+        else None
+    )
+    checkpoint_lora_config = (
+        checkpoint_metadata.get("lora_config")
+        if isinstance(checkpoint_metadata, dict)
+        else None
+    )
+    lora_config = resolve_lora_config(
+        rank=args.lora_rank,
+        alpha=args.lora_alpha,
+        dropout=args.lora_dropout,
+        target=args.lora_target,
+        checkpoint_config=checkpoint_lora_config,
+        full_checkpoint_resume=full_checkpoint_resume,
+    )
+    validate_lora_runtime(lora_config, args.script_modules)
 
-    if args.resume_from_ckpt:
-        if args.resume_model_weights_only:
-            # Load the checkpoint
-            if os.path.isdir(args.resume_from_ckpt):
-                sd = zero_to_fp32.get_fp32_state_dict_from_zero_checkpoint(
-                    args.resume_from_ckpt)
-            else:
-                sd = torch.load(args.resume_from_ckpt)
-            # Process the state dict
-            if 'module' in sd:
-                sd = {k[len('module.'):]: v for k, v in sd['module'].items()}
-                import_openfold_weights_(model=model_module, state_dict=sd)
-            elif 'state_dict' in sd:
-                import_openfold_weights_(
-                    model=model_module, state_dict=sd['state_dict'])
-            else:
-                # Loading from pre-trained model
-                sd = {'model.'+k: v for k, v in sd.items()}
-                import_openfold_weights_(model=model_module, state_dict=sd)
-            logging.info("Successfully loaded model weights...")
+    learning_rate = resolve_learning_rate(
+        args.learning_rate,
+        lora_enabled=lora_config.enabled,
+    )
+    training_config = {
+        "learning_rate": learning_rate,
+        "optimizer_eps": 1e-5,
+        "lr_base": 0.0,
+        "lr_warmup_steps": args.lr_warmup_steps,
+        "lr_start_decay_after_steps": args.lr_start_decay_after_steps,
+        "lr_decay_every_steps": args.lr_decay_every_steps,
+        "lr_decay_factor": args.lr_decay_factor,
+    }
+    model_module = OpenFoldWrapper(
+        config,
+        training_config=training_config,
+        lora_config=lora_config,
+    )
 
-        else:  # Loads a checkpoint to start from a specific time step
-            if os.path.isdir(args.resume_from_ckpt):
-                sd = get_model_state_dict_from_ds_checkpoint(args.resume_from_ckpt)
-            else:
-                sd = torch.load(args.resume_from_ckpt)
-            last_global_step = int(sd['global_step'])
-            model_module.resume_last_lr_step(last_global_step)
-            logging.info("Successfully loaded last lr step...")
+    initialization_weights = None
+    if args.resume_from_ckpt and args.resume_model_weights_only:
+        if (
+            os.path.isdir(args.resume_from_ckpt)
+            and args.init_weights_source == "auto"
+        ):
+            checkpoint = zero_to_fp32.get_fp32_state_dict_from_zero_checkpoint(
+                args.resume_from_ckpt
+            )
+        else:
+            checkpoint = checkpoint_metadata
+        initialization_weights, actual_init_source = extract_alphafold_weights(
+            checkpoint,
+            source=args.init_weights_source,
+            return_source=True,
+        )
+        print(
+            "Weights-only initialization source: "
+            f"requested={args.init_weights_source}, actual={actual_init_source}"
+        )
+    elif full_checkpoint_resume:
+        last_global_step = int(checkpoint_metadata["global_step"])
+        model_module.resume_last_lr_step(last_global_step)
+        logging.info("Successfully loaded last lr step...")
 
     if args.resume_from_jax_params:
         model_module.load_from_jax(args.resume_from_jax_params)
         logging.info(
             f"Successfully loaded JAX parameters at {args.resume_from_jax_params}...")
+
+    initialization_has_lora = (
+        initialization_weights is not None
+        and any(".lora_" in key for key in initialization_weights)
+    )
+    if initialization_has_lora and not lora_config.enabled:
+        raise ValueError(
+            "Weights-only checkpoint contains LoRA parameters but LoRA rank "
+            "is disabled and no usable lora_config was provided"
+        )
+    if initialization_has_lora:
+        replaced_modules = configure_lora(model_module.model, lora_config)
+        import_openfold_weights_(
+            model=model_module.model,
+            state_dict=initialization_weights,
+        )
+    else:
+        if initialization_weights is not None:
+            import_openfold_weights_(
+                model=model_module.model,
+                state_dict=initialization_weights,
+            )
+        replaced_modules = configure_lora(model_module.model, lora_config)
+    if initialization_weights is not None:
+        logging.info("Successfully loaded model weights...")
+    if should_reset_ema(full_checkpoint_resume):
+        # Weight-only, JAX, and fresh LoRA initialization must all begin with
+        # EMA exactly synchronized to the model, including adapter parameters.
+        reset_ema_from_model(model_module, decay=config.ema.decay)
+
+    counts = parameter_counts(model_module.model)
+    if lora_config.enabled:
+        print(f"LoRA modules ({len(replaced_modules)}):")
+        for module_name in replaced_modules:
+            print(f"  {module_name}")
+    print(
+        "Parameters: "
+        f"total={counts['total']}, "
+        f"trainable={counts['trainable']} "
+        f"({counts['trainable_percent']:.6f}%)"
+    )
+    preview_steps = sorted({
+        0,
+        1,
+        args.lr_warmup_steps,
+        args.lr_warmup_steps + 1,
+        args.lr_start_decay_after_steps,
+        args.lr_start_decay_after_steps + 1,
+    })
+    for step in preview_steps:
+        expected_lr = compute_alphafold_learning_rate(
+            step_no=step,
+            base_lr=0.0,
+            max_lr=learning_rate,
+            warmup_no_steps=args.lr_warmup_steps,
+            start_decay_after_n_steps=args.lr_start_decay_after_steps,
+            decay_every_n_steps=args.lr_decay_every_steps,
+            decay_factor=args.lr_decay_factor,
+        )
+        print(f"Expected learning rate at step {step}: {expected_lr:.10g}")
 
     # TorchScript components of the model
     if (args.script_modules):
@@ -356,9 +517,21 @@ def main(args):
     data_module.setup()
 
     callbacks = []
+    if args.checkpoint_every_epoch and args.checkpoint_every_n_train_steps:
+        raise ValueError(
+            "Use only one of --checkpoint_every_epoch and "
+            "--checkpoint_every_n_train_steps"
+        )
     if (args.checkpoint_every_epoch):
         mc = ModelCheckpoint(
             every_n_epochs=1,
+            auto_insert_metric_name=False,
+            save_top_k=-1,
+        )
+        callbacks.append(mc)
+    elif args.checkpoint_every_n_train_steps:
+        mc = ModelCheckpoint(
+            every_n_train_steps=args.checkpoint_every_n_train_steps,
             auto_insert_metric_name=False,
             save_top_k=-1,
         )
@@ -432,9 +605,11 @@ def main(args):
         os.system(f"{sys.executable} -m pip freeze > {freeze_path}")
         wdb_logger.experiment.save(f"{freeze_path}")
 
-    trainer_kws = ['num_nodes', 'precision', 'max_epochs', 'log_every_n_steps',
-                   'flush_logs_ever_n_steps', 'num_sanity_val_steps', 'reload_dataloaders_every_n_epochs']
-    trainer_args = {k: v for k, v in vars(args).items() if k in trainer_kws}
+    trainer_args, ignored_trainer_args = build_trainer_kwargs(
+        args,
+        pl.Trainer.__init__,
+    )
+    log_ignored_trainer_args(ignored_trainer_args)
     trainer_args.update({
         'default_root_dir': args.output_dir,
         'strategy': strategy,
@@ -559,6 +734,12 @@ if __name__ == "__main__":
         help="""Whether to checkpoint at the end of every training epoch"""
     )
     parser.add_argument(
+        "--checkpoint_every_n_train_steps",
+        type=int,
+        default=0,
+        help="Checkpoint every N optimizer steps; 0 disables step checkpoints.",
+    )
+    parser.add_argument(
         "--early_stopping", type=bool_type, default=False,
         help="Whether to stop training when validation loss fails to decrease"
     )
@@ -578,6 +759,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--resume_model_weights_only", type=bool_type, default=False,
         help="Whether to load just model weights as opposed to training state"
+    )
+    parser.add_argument(
+        "--init_weights_source",
+        choices=("ema", "module", "auto"),
+        default=DEFAULT_INIT_WEIGHTS_SOURCE,
+        help=(
+            "Checkpoint weight source for --resume_model_weights_only. "
+            "Defaults to EMA for fair comparison with public baseline inference. "
+            "Ignored for full checkpoint resume."
+        ),
     )
     parser.add_argument(
         "--resume_from_jax_params", type=str, default=None,
@@ -620,11 +811,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_epoch_len", type=int, default=10000,
         help=(
-            "The virtual length of each training epoch. Stochastic filtering "
+            "The number of stochastic training draws per virtual epoch; it "
+            "does not mean every unique sample is visited once. Filtering "
             "of training data means that training datasets have no "
             "well-defined length. This virtual length affects frequency of "
             "validation & checkpointing (by default, one of each per epoch)."
         )
+    )
+    parser.add_argument(
+        "--sampling_audit_path",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSONL output recording sampled unique labels, clusters, "
+            "cluster frequencies and ESS for every virtual epoch."
+        ),
+    )
+    parser.add_argument(
+        "--sampling_cluster_file",
+        type=str,
+        default=None,
+        help="Sequence cluster file used by --sampling_audit_path.",
     )
     parser.add_argument(
         "--log_lr", action="store_true", default=False,
@@ -657,6 +864,49 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mpi_plugin", action="store_true", default=False,
                         help="Whether to use MPI for parallele processing")
+    parser.add_argument(
+        "--lora_rank", type=int, default=None,
+        help="LoRA rank. Resolved default: 0 (disabled).",
+    )
+    parser.add_argument(
+        "--lora_alpha", type=float, default=None,
+        help="LoRA scaling alpha. Resolved default: 16.",
+    )
+    parser.add_argument(
+        "--lora_dropout", type=float, default=None,
+        help="LoRA input dropout. Resolved default: 0.0.",
+    )
+    parser.add_argument(
+        "--lora_target", type=str, default=None,
+        help=(
+            "LoRA target preset (structure_module, evoformer_attention, "
+            "all_linear), re:<regex>, or comma-separated module prefixes. "
+            "Resolved default: structure_module."
+        ),
+    )
+    parser.add_argument(
+        "--learning_rate", type=float, default=None,
+        help=(
+            "Maximum learning rate. Defaults to 1e-4 with LoRA and 1e-3 "
+            "without LoRA."
+        ),
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=1000,
+        help="Linear learning-rate warmup steps.",
+    )
+    parser.add_argument(
+        "--lr_start_decay_after_steps", type=int, default=50000,
+        help="Step after which exponential learning-rate decay begins.",
+    )
+    parser.add_argument(
+        "--lr_decay_every_steps", type=int, default=50000,
+        help="Number of steps per learning-rate decay interval.",
+    )
+    parser.add_argument(
+        "--lr_decay_factor", type=float, default=0.95,
+        help="Multiplicative learning-rate decay factor.",
+    )
 
     trainer_group = parser.add_argument_group(
         'Arguments to pass to PyTorch Lightning Trainer')
@@ -669,6 +919,9 @@ if __name__ == "__main__":
     )
     trainer_group.add_argument(
         "--max_epochs", type=int, default=1,
+    )
+    trainer_group.add_argument(
+        "--max_steps", type=int, default=-1,
     )
     trainer_group.add_argument(
         "--log_every_n_steps", type=int, default=25,
