@@ -62,14 +62,14 @@ def enforce_config_constraints(config):
     if config.globals.use_flash and not fa_is_installed:
         raise ValueError("use_flash requires that FlashAttention is installed")
 
-    deepspeed_is_installed = importlib.util.find_spec("deepspeed") is not None
-    ds4s_is_installed = deepspeed_is_installed and importlib.util.find_spec(
-        "deepspeed.ops.deepspeed4science") is not None
-    if config.globals.use_deepspeed_evo_attention and not ds4s_is_installed:
-        raise ValueError(
-            "use_deepspeed_evo_attention requires that DeepSpeed be installed "
-            "and that the deepspeed.ops.deepspeed4science package exists"
-        )
+    if config.globals.use_deepspeed_evo_attention:
+        try:
+            importlib.import_module("deepspeed.ops.deepspeed4science")
+        except Exception as exc:
+            raise ValueError(
+                "use_deepspeed_evo_attention requires a usable DeepSpeed "
+                "installation with deepspeed4science"
+            ) from exc
 
     cuequivariance_is_installed = importlib.util.find_spec("cuequivariance_torch") is not None
     if (config.globals.use_cuequivariance_attention or config.globals.use_cuequivariance_multiplicative_update) and not cuequivariance_is_installed:

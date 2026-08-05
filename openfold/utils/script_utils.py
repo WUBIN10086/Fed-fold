@@ -29,12 +29,15 @@ from openfold.utils.import_weights import (
     import_jax_weights_,
     import_openfold_weights_
 )
+from openfold.utils.training_utils import (
+    INFERENCE_AUTO_ORDER,
+    extract_alphafold_weights,
+)
 
 from pytorch_lightning.utilities.deepspeed import (
     convert_zero_checkpoint_to_fp32_state_dict
 )
 
-from .tensorrt_utils import instrument_with_trt_compile
 from .precision_utils import wrap_for_precision
 
 logging.basicConfig()
@@ -69,13 +72,21 @@ def make_output_directory(output_dir, model_name, multiple_model_mode):
 
 def _accelerate(model, config):
     if config.trt.mode is not None:
+        from .tensorrt_utils import instrument_with_trt_compile
         instrument_with_trt_compile(model, config)
     if config.precision is not None and config.precision in ['bf16', 'fp16']:
         model.evoformer = wrap_for_precision(model.evoformer, config.precision)
         model.extra_msa_stack = wrap_for_precision(model.extra_msa_stack, config.precision)
 
 
-def load_models_from_command_line(config, model_device, openfold_checkpoint_path, jax_param_path, output_dir):
+def load_models_from_command_line(
+    config,
+    model_device,
+    openfold_checkpoint_path,
+    jax_param_path,
+    output_dir,
+    checkpoint_weights_source="auto",
+):
     # Create the output directory
 
     multiple_model_mode = count_models_to_evaluate(openfold_checkpoint_path, jax_param_path) > 1
@@ -116,20 +127,27 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
                         path,
                         ckpt_path,
                     )
-                d = torch.load(ckpt_path)
-                import_openfold_weights_(model=model, state_dict=d["ema"]["params"])
+                # PyTorch >= 2.6 defaults weights_only=True; OpenFold ckpts embed ConfigDict.
+                d = torch.load(ckpt_path, weights_only=False)
             else:
                 ckpt_path = path
-                d = torch.load(ckpt_path)
+                d = torch.load(ckpt_path, weights_only=False)
 
-                if "ema" in d:
-                    # The public weights have had this done to them already
-                    d = d["ema"]["params"]
-                import_openfold_weights_(model=model, state_dict=d)
+            weights, actual_source = extract_alphafold_weights(
+                d,
+                source=checkpoint_weights_source,
+                auto_order=INFERENCE_AUTO_ORDER,
+                return_source=True,
+            )
+            import_openfold_weights_(model=model, state_dict=weights)
 
             model = model.to(model_device)
             logger.info(
-                f"Loaded OpenFold parameters at {path}..."
+                "Loaded OpenFold parameters at %s using source=%s "
+                "(requested=%s)...",
+                path,
+                actual_source,
+                checkpoint_weights_source,
             )
             output_directory = make_output_directory(output_dir, checkpoint_basename, multiple_model_mode)
             _accelerate(model, config)

@@ -25,9 +25,12 @@ kept_labels）按 **整个 cluster** 切成 train / test（同一 cluster 不跨
 """
 import argparse
 import csv
+import hashlib
+import json
 import os
 import random
 import shutil
+import statistics
 from pathlib import Path
 
 
@@ -45,35 +48,144 @@ def build_label_to_cluster(cluster_file: Path) -> dict[str, int]:
     return mapping
 
 
-def split_by_cluster(labels, label2cluster, test_frac, rng):
-    """按整簇划分 train/test。返回 (train_labels, test_labels)，保持输入大小写。"""
-    # 把候选 label 按 cluster 分组；找不到 cluster 的各自成簇
+def group_by_cluster(labels, label2cluster):
     clusters: dict[str, list[str]] = {}
-    singleton_seed = 0
     for lab in labels:
         cid = label2cluster.get(lab.upper())
-        key = f"c{cid}" if cid is not None else f"s{singleton_seed}"
-        if cid is None:
-            singleton_seed += 1
+        key = f"c{cid}" if cid is not None else f"singleton:{lab.upper()}"
         clusters.setdefault(key, []).append(lab)
+    return clusters
 
-    total = len(labels)
-    target_test = int(round(test_frac * total))
 
-    cluster_keys = list(clusters.keys())
-    rng.shuffle(cluster_keys)
+def read_baseline_difficulty(path: Path | None) -> dict[str, float]:
+    if path is None:
+        return {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = csv.DictReader(handle)
+        if "label" not in (rows.fieldnames or []):
+            raise ValueError("Difficulty CSV must contain a label column")
+        value_column = next(
+            (
+                name for name in ("tm_selected", "tm_score", "tm", "mean_tm")
+                if name in (rows.fieldnames or [])
+            ),
+            None,
+        )
+        if value_column is None:
+            raise ValueError("Difficulty CSV has no recognized TM-score column")
+        return {
+            row["label"].strip().upper(): float(row[value_column])
+            for row in rows
+            if row.get("label", "").strip()
+        }
 
-    test_labels: list[str] = []
-    train_labels: list[str] = []
-    for key in cluster_keys:
-        members = clusters[key]
-        # 还没到测试目标就放进 test，整簇放入
-        if len(test_labels) < target_test:
-            test_labels.extend(members)
-        else:
-            train_labels.extend(members)
 
-    return sorted(train_labels), sorted(test_labels)
+def difficulty_band(value):
+    if value is None:
+        return "unknown"
+    if value < 0.6:
+        return "hard"
+    if value < 0.8:
+        return "medium"
+    return "easy"
+
+
+def split_by_cluster(
+    labels,
+    label2cluster,
+    test_frac,
+    rng,
+    min_test_clusters=1,
+    difficulty=None,
+):
+    """按 cluster 数量和 baseline 难度分层划分，保持输入标签大小写。"""
+    clusters = group_by_cluster(labels, label2cluster)
+    cluster_count = len(clusters)
+    if cluster_count < 2:
+        raise ValueError("At least two sequence clusters are required")
+    target_test_clusters = max(
+        int(min_test_clusters),
+        int(round(test_frac * cluster_count)),
+    )
+    target_test_clusters = min(target_test_clusters, cluster_count - 1)
+    difficulty = difficulty or {}
+    strata = {}
+    for key, members in clusters.items():
+        values = [
+            difficulty[member.upper()]
+            for member in members
+            if member.upper() in difficulty
+        ]
+        band = difficulty_band(statistics.fmean(values) if values else None)
+        strata.setdefault(band, []).append(key)
+    for keys in strata.values():
+        rng.shuffle(keys)
+
+    ordered = []
+    band_order = ("hard", "medium", "easy", "unknown")
+    while len(ordered) < cluster_count:
+        for band in band_order:
+            keys = strata.get(band, [])
+            if keys:
+                ordered.append(keys.pop())
+    test_keys = set(ordered[:target_test_clusters])
+    train_labels = sorted(
+        member
+        for key, members in clusters.items()
+        if key not in test_keys
+        for member in members
+    )
+    test_labels = sorted(
+        member
+        for key, members in clusters.items()
+        if key in test_keys
+        for member in members
+    )
+    train_keys = sorted(set(clusters) - test_keys)
+    return train_labels, test_labels, train_keys, sorted(test_keys)
+
+
+def labels_sha256(labels):
+    payload = "".join(f"{label}\n" for label in sorted(labels))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def difficulty_distribution(labels, difficulty):
+    counts = {"hard": 0, "medium": 0, "easy": 0, "unknown": 0}
+    for label in labels:
+        counts[difficulty_band(difficulty.get(label.upper()))] += 1
+    return counts
+
+
+def write_reclustered_chain_cache(
+    source_path,
+    output_path,
+    train_labels,
+    label2cluster,
+):
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    grouped = group_by_cluster(train_labels, label2cluster)
+    cluster_sizes = {
+        label.upper(): len(members)
+        for members in grouped.values()
+        for label in members
+    }
+    filtered = {}
+    for label in train_labels:
+        source_key = next(
+            (key for key in (label, label.upper(), label.lower()) if key in source),
+            None,
+        )
+        if source_key is None:
+            raise ValueError(f"Chain cache is missing train label {label}")
+        entry = dict(source[source_key])
+        entry["cluster_size"] = cluster_sizes[label.upper()]
+        filtered[label] = entry
+    output_path.write_text(
+        json.dumps(filtered, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return filtered
 
 
 def copy_or_link(src: Path, dst: Path, link: bool):
@@ -97,6 +209,18 @@ def main():
     ap.add_argument("--test-frac", type=float, default=0.2, help="每个 client 划为测试的比例")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
+        "--min-test-clusters",
+        type=int,
+        default=1,
+        help="每个 client 至少进入测试集的 sequence cluster 数",
+    )
+    ap.add_argument(
+        "--baseline-difficulty-csv",
+        type=Path,
+        default=None,
+        help="可选 baseline TM CSV；用于按 hard/medium/easy 分层选择 cluster",
+    )
+    ap.add_argument(
         "--labels-subpath", type=str,
         default="solo_fasta_dir_finetune/_reports/kept_labels.txt",
         help="每个 client 的候选标签清单相对路径（默认=低 pLDDT 微调子集 kept_labels）",
@@ -104,11 +228,16 @@ def main():
     ap.add_argument("--fasta-subdir", type=str, default="solo_fasta_dir", help="每个 client 的全量 fasta 目录名")
     ap.add_argument("--emb-subdir", type=str, default="solo_alignment_dir", help="每个 client 的 embedding 目录名")
     ap.add_argument("--cif-subdir", type=str, default="mmcif_files", help="每个 client 的 cif 目录名")
+    ap.add_argument(
+        "--chain-cache-subpath",
+        default="solo_chain_data_cache_finetune.json",
+        help="用于生成 final train split 重算 cluster_size cache 的相对路径",
+    )
     ap.add_argument("--link", action="store_true", help="用软链接代替复制（embedding/cif 省磁盘）")
     args = ap.parse_args()
 
-    rng = random.Random(args.seed)
     label2cluster = build_label_to_cluster(args.cluster_file)
+    difficulty = read_baseline_difficulty(args.baseline_difficulty_csv)
 
     all_dir = args.out_dir / "all"
     (all_dir / "solo_fasta_dir").mkdir(parents=True, exist_ok=True)
@@ -116,6 +245,7 @@ def main():
     (all_dir / "mmcif_files").mkdir(parents=True, exist_ok=True)
 
     union_test: list[tuple[str, str]] = []  # (label, client_name)
+    split_manifests = []
 
     for i in range(args.num_clients):
         client = f"client_{i}"
@@ -126,12 +256,65 @@ def main():
             continue
 
         labels = read_labels(labels_path)
-        train_labels, test_labels = split_by_cluster(labels, label2cluster, args.test_frac, rng)
+        train_labels, test_labels, train_clusters, test_clusters = (
+            split_by_cluster(
+                labels,
+                label2cluster,
+                args.test_frac,
+                random.Random(args.seed + i),
+                min_test_clusters=args.min_test_clusters,
+                difficulty=difficulty,
+            )
+        )
+        if set(train_clusters) & set(test_clusters):
+            raise AssertionError(f"{client}: cluster leakage detected")
 
         out_client = args.out_dir / client
         out_client.mkdir(parents=True, exist_ok=True)
         (out_client / "train_labels.txt").write_text("\n".join(train_labels) + "\n", encoding="utf-8")
         (out_client / "test_labels.txt").write_text("\n".join(test_labels) + "\n", encoding="utf-8")
+        source_cache = client_dir / args.chain_cache_subpath
+        if source_cache.exists():
+            reclustered = write_reclustered_chain_cache(
+                source_cache,
+                out_client / "train_chain_data_cache.json",
+                train_labels,
+                label2cluster,
+            )
+        else:
+            reclustered = None
+        split_manifest = {
+            "client": client,
+            "seed": args.seed + i,
+            "test_fraction_by_cluster": args.test_frac,
+            "min_test_clusters": args.min_test_clusters,
+            "label_count": len(labels),
+            "train_label_count": len(train_labels),
+            "test_label_count": len(test_labels),
+            "train_cluster_count": len(train_clusters),
+            "test_cluster_count": len(test_clusters),
+            "train_cluster_ids": train_clusters,
+            "test_cluster_ids": test_clusters,
+            "train_labels_sha256": labels_sha256(train_labels),
+            "test_labels_sha256": labels_sha256(test_labels),
+            "train_difficulty": difficulty_distribution(
+                train_labels,
+                difficulty,
+            ),
+            "test_difficulty": difficulty_distribution(
+                test_labels,
+                difficulty,
+            ),
+            "cluster_leakage": False,
+            "reclustered_chain_cache_count": (
+                len(reclustered) if reclustered is not None else None
+            ),
+        }
+        (out_client / "split_manifest.json").write_text(
+            json.dumps(split_manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        split_manifests.append(split_manifest)
         print(f"{client}: 候选={len(labels)} -> train={len(train_labels)} test={len(test_labels)}")
 
         # 把该 client 的测试样本汇入并集
@@ -173,6 +356,30 @@ def main():
         w = csv.writer(f)
         w.writerow(["label", "client"])
         w.writerows(union_test)
+    (args.out_dir / "split_manifest.json").write_text(
+        json.dumps(
+            {
+                "seed": args.seed,
+                "cluster_file": str(args.cluster_file),
+                "cluster_file_sha256": hashlib.sha256(
+                    args.cluster_file.read_bytes()
+                ).hexdigest(),
+                "baseline_difficulty_csv": (
+                    str(args.baseline_difficulty_csv)
+                    if args.baseline_difficulty_csv is not None
+                    else None
+                ),
+                "clients": split_manifests,
+                "union_test_labels_sha256": labels_sha256(
+                    [label for label, _ in union_test]
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     print(f"\n并集测试集: {len(union_test)} 条链 -> {all_dir}")
     print(f"  fasta:     {all_dir / 'solo_fasta_dir'}")

@@ -1,6 +1,40 @@
 import torch
 
 
+def compute_alphafold_learning_rate(
+    step_no: int,
+    base_lr: float = 0.0,
+    max_lr: float = 0.001,
+    warmup_no_steps: int = 1000,
+    start_decay_after_n_steps: int = 50000,
+    decay_every_n_steps: int = 50000,
+    decay_factor: float = 0.95,
+) -> float:
+    if step_no < 0:
+        raise ValueError("step_no must be nonnegative")
+    if warmup_no_steps < 0:
+        raise ValueError("warmup_no_steps must be nonnegative")
+    if start_decay_after_n_steps < 0:
+        raise ValueError("start_decay_after_n_steps must be nonnegative")
+    if decay_every_n_steps <= 0:
+        raise ValueError("decay_every_n_steps must be positive")
+    if warmup_no_steps > start_decay_after_n_steps:
+        raise ValueError(
+            "warmup_no_steps must not exceed start_decay_after_n_steps"
+        )
+    if not 0.0 < decay_factor <= 1.0:
+        raise ValueError("decay_factor must be in (0, 1]")
+
+    if warmup_no_steps > 0 and step_no <= warmup_no_steps:
+        fraction = step_no / warmup_no_steps
+        return base_lr + fraction * (max_lr - base_lr)
+    if step_no > start_decay_after_n_steps:
+        steps_since_decay = step_no - start_decay_after_n_steps
+        exponent = (steps_since_decay // decay_every_n_steps) + 1
+        return max_lr * (decay_factor ** exponent)
+    return max_lr
+
+
 class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
     """ Implements the learning rate schedule defined in the AlphaFold 2
         supplement. A linear warmup is followed by a plateau at the maximum
@@ -21,19 +55,15 @@ class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         decay_every_n_steps: int = 50000,
         decay_factor: float = 0.95,
     ):
-        step_counts = {
-            "warmup_no_steps": warmup_no_steps,
-            "start_decay_after_n_steps": start_decay_after_n_steps,
-        }
-
-        for k,v in step_counts.items():
-            if(v < 0):
-                raise ValueError(f"{k} must be nonnegative")
-
-        if(warmup_no_steps > start_decay_after_n_steps):
-            raise ValueError(
-                "warmup_no_steps must not exceed start_decay_after_n_steps"
-            )
+        compute_alphafold_learning_rate(
+            step_no=max(last_epoch, 0),
+            base_lr=base_lr,
+            max_lr=max_lr,
+            warmup_no_steps=warmup_no_steps,
+            start_decay_after_n_steps=start_decay_after_n_steps,
+            decay_every_n_steps=decay_every_n_steps,
+            decay_factor=decay_factor,
+        )
 
         self.optimizer = optimizer
         self.last_epoch = last_epoch
@@ -45,10 +75,10 @@ class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
         self.decay_every_n_steps = decay_every_n_steps
         self.decay_factor = decay_factor
 
+        # PyTorch >= 2.2 removed LRScheduler's `verbose` kwarg.
         super(AlphaFoldLRScheduler, self).__init__(
             optimizer,
-            last_epoch=last_epoch, 
-            verbose=verbose,
+            last_epoch=last_epoch,
         )
 
     def state_dict(self):
@@ -68,15 +98,14 @@ class AlphaFoldLRScheduler(torch.optim.lr_scheduler._LRScheduler):
                 "get_last_lr()"
             )
 
-        step_no = self.last_epoch
-
-        if(step_no <= self.warmup_no_steps):
-            lr = self.base_lr + (step_no / self.warmup_no_steps) * self.max_lr
-        elif(step_no > self.start_decay_after_n_steps):
-            steps_since_decay = step_no - self.start_decay_after_n_steps
-            exp = (steps_since_decay // self.decay_every_n_steps) + 1
-            lr = self.max_lr * (self.decay_factor ** exp)
-        else: # plateau
-            lr = self.max_lr
+        lr = compute_alphafold_learning_rate(
+            step_no=self.last_epoch,
+            base_lr=self.base_lr,
+            max_lr=self.max_lr,
+            warmup_no_steps=self.warmup_no_steps,
+            start_decay_after_n_steps=self.start_decay_after_n_steps,
+            decay_every_n_steps=self.decay_every_n_steps,
+            decay_factor=self.decay_factor,
+        )
 
         return [lr for group in self.optimizer.param_groups]
