@@ -43,9 +43,15 @@ from openfold.utils.logger import PerformanceLoggingCallback
 
 
 class OpenFoldWrapper(pl.LightningModule):
-    def __init__(self, config):
+    def __init__(self, config, max_lr: float = 1e-3, warmup_no_steps: int = 1000):
         super(OpenFoldWrapper, self).__init__()
         self.config = config
+        # LR schedule params (defaults reproduce the original hardcoded AlphaFold
+        # schedule: warmup 0->1e-3 over 1000 steps, then plateau). Exposed so that
+        # multi-GPU data-parallel runs can apply linear LR scaling + a shorter
+        # warmup proportional to the reduced step count.
+        self.max_lr = max_lr
+        self.warmup_no_steps = warmup_no_steps
         self.model = AlphaFold(config)
         self.is_multimer = self.config.globals.is_multimer
 
@@ -214,10 +220,10 @@ class OpenFoldWrapper(pl.LightningModule):
 
         return metrics
 
-    def configure_optimizers(self, 
-        learning_rate: float = 1e-3,
+    def configure_optimizers(self,
         eps: float = 1e-5,
     ) -> torch.optim.Adam:
+        learning_rate = self.max_lr
         # Ignored as long as a DeepSpeed optimizer is configured
         optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -232,7 +238,9 @@ class OpenFoldWrapper(pl.LightningModule):
 
         lr_scheduler = AlphaFoldLRScheduler(
             optimizer,
-            last_epoch=self.last_lr_step
+            last_epoch=self.last_lr_step,
+            max_lr=self.max_lr,
+            warmup_no_steps=self.warmup_no_steps,
         )
 
         return {
@@ -298,7 +306,11 @@ def main(args):
             custom_config_dict = json.load(f)
         config.update_from_flattened_dict(custom_config_dict)
 
-    model_module = OpenFoldWrapper(config)
+    model_module = OpenFoldWrapper(
+        config,
+        max_lr=args.max_lr,
+        warmup_no_steps=args.warmup_no_steps,
+    )
 
     if args.resume_from_ckpt:
         if args.resume_model_weights_only:
@@ -320,6 +332,17 @@ def main(args):
                 sd = {'model.'+k: v for k, v in sd.items()}
                 import_openfold_weights_(model=model_module, state_dict=sd)
             logging.info("Successfully loaded model weights...")
+
+            # The EMA was cloned from the RANDOM init inside OpenFoldWrapper.__init__,
+            # i.e. before the pretrained weights above were loaded. Inference/eval/
+            # FedAvg all read the EMA params, so without this re-sync every early
+            # checkpoint's EMA is a random-contaminated mix (decay=0.999 => it only
+            # crawls toward the real weights at 1e-3/step). Re-seed the EMA from the
+            # freshly-loaded weights so fine-tuning tracks the pretrained model.
+            model_module.ema = ExponentialMovingAverage(
+                model=model_module.model, decay=config.ema.decay
+            )
+            logging.info("Re-initialized EMA from loaded weights (finetune fix)...")
 
         else:  # Loads a checkpoint to start from a specific time step
             if os.path.isdir(args.resume_from_ckpt):
@@ -643,6 +666,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_lr", action="store_true", default=False,
         help="Whether to log the actual learning rate"
+    )
+    parser.add_argument(
+        "--max_lr", type=float, default=1e-3,
+        help=(
+            "Peak learning rate for the AlphaFold LR schedule. Default 1e-3 "
+            "reproduces the original hardcoded value. For multi-GPU data-parallel "
+            "runs, scale this with the effective batch size (e.g. 4e-3 for 4 GPUs)."
+        )
+    )
+    parser.add_argument(
+        "--warmup_no_steps", type=int, default=1000,
+        help=(
+            "Linear warmup length (steps) for the LR schedule. Default 1000. "
+            "Shorten proportionally when reducing total steps (e.g. 250 for a "
+            "2500-step run)."
+        )
     )
     parser.add_argument(
         "--config_preset", type=str, default="initial_training",
