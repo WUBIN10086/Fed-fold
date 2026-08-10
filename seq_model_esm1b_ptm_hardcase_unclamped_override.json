@@ -1,0 +1,10 @@
+{
+  "data.train.max_msa_clusters": 1,
+  "data.eval.max_msa_clusters": 1,
+  "data.train.max_distillation_msa_clusters": 1,
+  "data.train.block_delete_msa": false,
+  "data.train.crop_size": 384,
+  "data.supervised.clamp_prob": 0.0,
+  "loss.violation.weight": 1.0,
+  "loss.experimentally_resolved.weight": 0.01
+}

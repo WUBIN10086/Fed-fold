@@ -93,11 +93,28 @@ def checkpoint_blocks(
     elif blocks_per_ckpt < 1 or blocks_per_ckpt > len(blocks):
         raise ValueError("blocks_per_ckpt must be between 1 and len(blocks)")
 
-    checkpoint = get_checkpoint_fn() 
+    checkpoint = get_checkpoint_fn()
 
     for s in range(0, len(blocks), blocks_per_ckpt):
         e = s + blocks_per_ckpt
-        args = checkpoint(chunker(s, e), *args)
+        # Reentrant checkpoint implementations attach their backward graph only
+        # when at least one input requires gradients. That silently freezes a
+        # trainable LoRA module inside a checkpointed block when all preceding
+        # model parameters are frozen. Native non-reentrant checkpointing
+        # records parameter gradients even for frozen inputs and is therefore
+        # required for this case. It is also the recommended PyTorch mode.
+        inputs_require_grad = any(
+            torch.is_tensor(arg) and arg.requires_grad for arg in args
+        )
+        if (
+            checkpoint is torch.utils.checkpoint.checkpoint
+            or not inputs_require_grad
+        ):
+            args = torch.utils.checkpoint.checkpoint(
+                chunker(s, e), *args, use_reentrant=False
+            )
+        else:
+            args = checkpoint(chunker(s, e), *args)
         args = wrap(args)
 
     return args

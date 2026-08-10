@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks.lr_monitor import LearningRateMonitor
 from pytorch_lightning.callbacks import DeviceStatsMonitor
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from pytorch_lightning.strategies import DDPStrategy, DeepSpeedStrategy
 from pytorch_lightning.plugins.environments import MPIEnvironment
 from pytorch_lightning import seed_everything
@@ -30,7 +30,13 @@ from openfold.utils.lora import (
     configure_lora,
     parameter_counts,
 )
-from openfold.utils.loss import AlphaFoldLoss, lddt_ca
+from openfold.utils.loss import (
+    AlphaFoldLoss,
+    baseline_distance_preservation_loss,
+    baseline_guided_hard_correction_loss,
+    baseline_guided_hard_soft_tm_loss,
+    lddt_ca,
+)
 from openfold.utils.lr_schedulers import (
     AlphaFoldLRScheduler,
     compute_alphafold_learning_rate,
@@ -136,6 +142,103 @@ class OpenFoldWrapper(pl.LightningModule):
         loss, loss_breakdown = self.loss(
             outputs, batch, _return_breakdown=True
         )
+        preservation_weight = float(
+            self.training_config.get("baseline_preservation_weight", 0.0)
+        )
+        if preservation_weight > 0.0:
+            preservation = baseline_distance_preservation_loss(
+                all_atom_pred_pos=outputs["final_atom_positions"],
+                baseline_ca_positions=batch["baseline_ca_positions"],
+                baseline_ca_mask=batch["baseline_ca_mask"],
+                baseline_preservation_active=(
+                    batch["baseline_preservation_active"]
+                ),
+            )
+            seq_len = torch.mean(batch["seq_length"].float())
+            crop_len = batch["aatype"].shape[-1]
+            length_scale = torch.sqrt(
+                torch.minimum(
+                    seq_len,
+                    seq_len.new_tensor(float(crop_len)),
+                )
+            )
+            loss = loss + preservation_weight * preservation * length_scale
+            loss_breakdown["baseline_preservation"] = preservation.detach()
+            loss_breakdown["loss"] = loss.detach()
+
+        hard_correction_weight = float(
+            self.training_config.get("hard_correction_weight", 0.0)
+        )
+        if hard_correction_weight > 0.0:
+            hard_correction = baseline_guided_hard_correction_loss(
+                all_atom_pred_pos=outputs["final_atom_positions"],
+                all_atom_positions=batch["all_atom_positions"],
+                all_atom_mask=batch["all_atom_mask"],
+                baseline_ca_positions=batch["baseline_ca_positions"],
+                baseline_ca_mask=batch["baseline_ca_mask"],
+                baseline_hard_active=batch["baseline_hard_active"],
+                margin=float(
+                    self.training_config["hard_correction_margin"]
+                ),
+                min_baseline_error=float(
+                    self.training_config[
+                        "hard_correction_min_baseline_error"
+                    ]
+                ),
+                min_sequence_separation=int(
+                    self.training_config[
+                        "hard_correction_min_sequence_separation"
+                    ]
+                ),
+            )
+            seq_len = torch.mean(batch["seq_length"].float())
+            crop_len = batch["aatype"].shape[-1]
+            length_scale = torch.sqrt(
+                torch.minimum(
+                    seq_len,
+                    seq_len.new_tensor(float(crop_len)),
+                )
+            )
+            loss = (
+                loss
+                + hard_correction_weight
+                * hard_correction
+                * length_scale
+            )
+            loss_breakdown["hard_correction"] = hard_correction.detach()
+            loss_breakdown["loss"] = loss.detach()
+
+        hard_soft_tm_weight = float(
+            self.training_config.get("hard_soft_tm_weight", 0.0)
+        )
+        if hard_soft_tm_weight > 0.0:
+            hard_soft_tm = baseline_guided_hard_soft_tm_loss(
+                all_atom_pred_pos=outputs["final_atom_positions"],
+                all_atom_positions=batch["all_atom_positions"],
+                all_atom_mask=batch["all_atom_mask"],
+                baseline_ca_positions=batch["baseline_ca_positions"],
+                baseline_ca_mask=batch["baseline_ca_mask"],
+                baseline_hard_active=batch["baseline_hard_active"],
+                score_margin=float(
+                    self.training_config["hard_soft_tm_margin"]
+                ),
+            )
+            seq_len = torch.mean(batch["seq_length"].float())
+            crop_len = batch["aatype"].shape[-1]
+            length_scale = torch.sqrt(
+                torch.minimum(
+                    seq_len,
+                    seq_len.new_tensor(float(crop_len)),
+                )
+            )
+            loss = (
+                loss
+                + hard_soft_tm_weight
+                * hard_soft_tm
+                * length_scale
+            )
+            loss_breakdown["hard_soft_tm"] = hard_soft_tm.detach()
+            loss_breakdown["loss"] = loss.detach()
 
         # Log it
         self._log(loss_breakdown, batch, outputs)
@@ -346,6 +449,20 @@ def load_checkpoint_metadata(checkpoint_path):
     return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
+def apply_trainable_scope(model, scope, *, lora_enabled=False):
+    """Apply an explicit non-LoRA trainable scope for diagnostic controls."""
+    if scope == "default":
+        return []
+    if lora_enabled:
+        raise ValueError("--trainable_scope cannot be combined with enabled LoRA")
+    if scope == "structure_module":
+        from scripts.positive_control_structure_module import (
+            selective_unfreeze_structure_module,
+        )
+        return selective_unfreeze_structure_module(model)
+    raise ValueError(f"Unknown trainable scope: {scope}")
+
+
 def main(args):
     if(args.seed is not None):
         seed_everything(args.seed, workers=True) 
@@ -399,6 +516,17 @@ def main(args):
         "lr_start_decay_after_steps": args.lr_start_decay_after_steps,
         "lr_decay_every_steps": args.lr_decay_every_steps,
         "lr_decay_factor": args.lr_decay_factor,
+        "baseline_preservation_weight": args.baseline_preservation_weight,
+        "hard_correction_weight": args.hard_correction_weight,
+        "hard_correction_margin": args.hard_correction_margin,
+        "hard_correction_min_baseline_error": (
+            args.hard_correction_min_baseline_error
+        ),
+        "hard_correction_min_sequence_separation": (
+            args.hard_correction_min_sequence_separation
+        ),
+        "hard_soft_tm_weight": args.hard_soft_tm_weight,
+        "hard_soft_tm_margin": args.hard_soft_tm_margin,
     }
     model_module = OpenFoldWrapper(
         config,
@@ -460,6 +588,16 @@ def main(args):
         replaced_modules = configure_lora(model_module.model, lora_config)
     if initialization_weights is not None:
         logging.info("Successfully loaded model weights...")
+    scoped_names = apply_trainable_scope(
+        model_module.model,
+        args.trainable_scope,
+        lora_enabled=lora_config.enabled,
+    )
+    if scoped_names:
+        print(
+            f"Trainable scope={args.trainable_scope}: "
+            f"parameter_tensors={len(scoped_names)}"
+        )
     if should_reset_ema(full_checkpoint_resume):
         # Weight-only, JAX, and fresh LoRA initialization must all begin with
         # EMA exactly synchronized to the model, including adapter parameters.
@@ -562,6 +700,14 @@ def main(args):
         callbacks.append(lr_monitor)
 
     loggers = []
+    if args.csv_log_metrics:
+        loggers.append(
+            CSVLogger(
+                save_dir=args.output_dir,
+                name="csv_logs",
+                version="",
+            )
+        )
     is_rank_zero = args.mpi_plugin and (int(os.environ.get("PMI_RANK")) == 0)
     if(args.wandb):
         if args.mpi_plugin and is_rank_zero:
@@ -834,8 +980,111 @@ if __name__ == "__main__":
         help="Sequence cluster file used by --sampling_audit_path.",
     )
     parser.add_argument(
+        "--sampling_mode",
+        type=str,
+        default="uniform",
+        choices=(
+            "uniform",
+            "hard_aware",
+            "hard_aware_50",
+            "hard_aware_70",
+        ),
+        help=(
+            "Train sampling policy. hard_aware_* oversamples baseline-hard "
+            "labels while keeping medium/easy anchors."
+        ),
+    )
+    parser.add_argument(
+        "--difficulty_csv",
+        type=str,
+        default=None,
+        help="Baseline difficulty CSV with label and difficulty/baseline_tm.",
+    )
+    parser.add_argument(
+        "--hard_aware_ratios",
+        type=str,
+        default="0.7,0.15,0.15",
+        help="hard,medium,easy target ratios for sampling_mode=hard_aware.",
+    )
+    parser.add_argument(
+        "--difficulty_conditioned_fape",
+        action="store_true",
+        default=False,
+        help=(
+            "Use unclamped FAPE for baseline-hard training labels and "
+            "clamped FAPE for medium/easy labels. Requires "
+            "--difficulty_csv."
+        ),
+    )
+    parser.add_argument(
+        "--baseline_preservation_dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory of local baseline *_unrelaxed.pdb predictions used "
+            "as medium/easy structure-preservation targets."
+        ),
+    )
+    parser.add_argument(
+        "--baseline_preservation_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of non-hard baseline C-alpha distance preservation; "
+            "zero disables it."
+        ),
+    )
+    parser.add_argument(
+        "--hard_correction_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the hard-only long-range C-alpha improvement margin; "
+            "zero disables it."
+        ),
+    )
+    parser.add_argument(
+        "--hard_correction_margin",
+        type=float,
+        default=0.5,
+        help="Required Angstrom improvement over baseline on selected pairs.",
+    )
+    parser.add_argument(
+        "--hard_correction_min_baseline_error",
+        type=float,
+        default=2.0,
+        help="Minimum baseline C-alpha pair-distance error in Angstrom.",
+    )
+    parser.add_argument(
+        "--hard_correction_min_sequence_separation",
+        type=int,
+        default=12,
+        help="Minimum residue separation for hard-correction distance pairs.",
+    )
+    parser.add_argument(
+        "--hard_soft_tm_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the hard-only baseline-relative aligned soft-TM loss; "
+            "zero disables it."
+        ),
+    )
+    parser.add_argument(
+        "--hard_soft_tm_margin",
+        type=float,
+        default=0.02,
+        help="Required soft-TM score improvement over the local baseline.",
+    )
+    parser.add_argument(
         "--log_lr", action="store_true", default=False,
         help="Whether to log the actual learning rate"
+    )
+    parser.add_argument(
+        "--csv_log_metrics",
+        action="store_true",
+        default=False,
+        help="Persist step/epoch loss breakdowns to output_dir/csv_logs/metrics.csv.",
     )
     parser.add_argument(
         "--config_preset", type=str, default="initial_training",
@@ -882,6 +1131,16 @@ if __name__ == "__main__":
             "LoRA target preset (structure_module, evoformer_attention, "
             "all_linear), re:<regex>, or comma-separated module prefixes. "
             "Resolved default: structure_module."
+        ),
+    )
+    parser.add_argument(
+        "--trainable_scope",
+        choices=("default", "structure_module"),
+        default="default",
+        help=(
+            "Explicit non-LoRA diagnostic trainable scope. "
+            "structure_module freezes all other model parameters and cannot "
+            "be combined with enabled LoRA."
         ),
     )
     parser.add_argument(
@@ -940,6 +1199,58 @@ if __name__ == "__main__":
         help="Accumulate gradients over k batches before next optimizer step.")
 
     args = parser.parse_args()
+
+    if args.difficulty_conditioned_fape and not args.difficulty_csv:
+        raise ValueError(
+            "--difficulty_conditioned_fape requires --difficulty_csv"
+        )
+    if (
+        args.difficulty_conditioned_fape
+        and "multimer" in args.config_preset
+    ):
+        raise ValueError(
+            "--difficulty_conditioned_fape currently supports monomer "
+            "presets only"
+        )
+    if args.baseline_preservation_weight < 0.0:
+        raise ValueError("--baseline_preservation_weight must be non-negative")
+    if args.hard_correction_weight < 0.0:
+        raise ValueError("--hard_correction_weight must be non-negative")
+    if args.hard_correction_margin < 0.0:
+        raise ValueError("--hard_correction_margin must be non-negative")
+    if args.hard_correction_min_baseline_error < 0.0:
+        raise ValueError(
+            "--hard_correction_min_baseline_error must be non-negative"
+        )
+    if args.hard_correction_min_sequence_separation < 1:
+        raise ValueError(
+            "--hard_correction_min_sequence_separation must be positive"
+        )
+    if args.hard_soft_tm_weight < 0.0:
+        raise ValueError("--hard_soft_tm_weight must be non-negative")
+    if args.hard_soft_tm_margin < 0.0:
+        raise ValueError("--hard_soft_tm_margin must be non-negative")
+    baseline_guidance_enabled = (
+        args.baseline_preservation_weight > 0.0
+        or args.hard_correction_weight > 0.0
+        or args.hard_soft_tm_weight > 0.0
+    )
+    if baseline_guidance_enabled:
+        if not args.baseline_preservation_dir:
+            raise ValueError(
+                "Baseline-guided losses require "
+                "--baseline_preservation_dir"
+            )
+        if not args.difficulty_csv:
+            raise ValueError(
+                "Baseline-guided losses require --difficulty_csv"
+            )
+        if "multimer" in args.config_preset:
+            raise ValueError(
+                "Baseline-guided losses currently support monomer presets only"
+            )
+        if not os.path.isdir(args.baseline_preservation_dir):
+            raise FileNotFoundError(args.baseline_preservation_dir)
 
     if (args.seed is None and
         ((args.gpus is not None and args.gpus > 1) or

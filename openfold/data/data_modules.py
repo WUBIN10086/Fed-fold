@@ -5,12 +5,14 @@ import json
 import logging
 import os
 import pickle
-from typing import Optional, Sequence, Any, Union
+from typing import Optional, Sequence, Any, Union, Dict, List, Tuple
 
 import ml_collections as mlc
 import pytorch_lightning as pl
 import torch
+from Bio.Align import PairwiseAligner
 from torch.utils.data import RandomSampler
+from openfold.np import residue_constants
 from openfold.np.residue_constants import restypes
 from openfold.data import (
     data_pipeline,
@@ -35,7 +37,260 @@ def load_sampling_clusters(path):
     return mapping
 
 
-def compute_sampling_audit(labels, label_to_cluster):
+def load_difficulty_bands(path: Optional[str]) -> Dict[str, str]:
+    """Load label -> hard/medium/easy/unknown from a difficulty CSV."""
+    if not path:
+        return {}
+    import csv
+
+    mapping: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            label = (row.get("label") or "").strip()
+            if not label:
+                continue
+            band = (row.get("difficulty") or "").strip().lower()
+            if not band and row.get("baseline_tm"):
+                try:
+                    tm = float(row["baseline_tm"])
+                except ValueError:
+                    band = "unknown"
+                else:
+                    if tm < 0.5:
+                        band = "hard"
+                    elif tm < 0.8:
+                        band = "medium"
+                    else:
+                        band = "easy"
+            mapping[label.upper()] = band or "unknown"
+    return mapping
+
+
+def difficulty_conditioned_fape_clamp_value(band: str) -> Optional[float]:
+    """Use global FAPE on hard examples and clamped FAPE on anchors."""
+    normalized = (band or "unknown").strip().lower()
+    if normalized == "hard":
+        return 0.0
+    if normalized in {"medium", "easy"}:
+        return 1.0
+    return None
+
+
+def read_pdb_ca_structure(path: str) -> Tuple[str, torch.Tensor]:
+    """Read residue identities and C-alpha coordinates from one PDB model."""
+    residues = []
+    coordinates = []
+    seen = set()
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("ENDMDL"):
+                break
+            if not line.startswith(("ATOM  ", "HETATM")):
+                continue
+            if (
+                line[12:16].strip() != "CA"
+                or line[16:17] not in (" ", "A")
+            ):
+                continue
+            residue_key = (line[21:22], line[22:26], line[26:27])
+            if residue_key in seen:
+                continue
+            seen.add(residue_key)
+            residue_name = line[17:20].strip()
+            residues.append(
+                "M" if residue_name == "MSE"
+                else residue_constants.restype_3to1.get(residue_name, "X")
+            )
+            coordinates.append([
+                float(line[30:38]),
+                float(line[38:46]),
+                float(line[46:54]),
+            ])
+    if not coordinates:
+        raise ValueError(f"No C-alpha atoms found in baseline PDB: {path}")
+    return (
+        "".join(residues),
+        torch.tensor(coordinates, dtype=torch.float32),
+    )
+
+
+def read_pdb_ca_coordinates(path: str) -> torch.Tensor:
+    """Backward-compatible coordinate-only PDB reader."""
+    return read_pdb_ca_structure(path)[1]
+
+
+def align_baseline_ca_to_sequence(
+    baseline_sequence: str,
+    baseline_ca: torch.Tensor,
+    target_sequence: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Align possibly incomplete baseline C-alpha coordinates to train indices."""
+    if len(baseline_sequence) != len(baseline_ca):
+        raise ValueError("Baseline sequence/coordinate length mismatch")
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.match_score = 2.0
+    aligner.mismatch_score = -1.0
+    aligner.open_gap_score = -5.0
+    aligner.extend_gap_score = -0.5
+    alignment = aligner.align(baseline_sequence, target_sequence)[0]
+    aligned_ca = torch.zeros((len(target_sequence), 3), dtype=torch.float32)
+    aligned_mask = torch.zeros(len(target_sequence), dtype=torch.float32)
+    for (base_start, base_end), (target_start, target_end) in zip(
+        alignment.aligned[0], alignment.aligned[1]
+    ):
+        length = min(base_end - base_start, target_end - target_start)
+        if length <= 0:
+            continue
+        base_slice = slice(int(base_start), int(base_start + length))
+        target_slice = slice(int(target_start), int(target_start + length))
+        aligned_ca[target_slice] = baseline_ca[base_slice]
+        aligned_mask[target_slice] = 1.0
+    if int(aligned_mask.sum()) < 2:
+        raise ValueError("Fewer than two baseline C-alpha atoms aligned")
+    return aligned_ca, aligned_mask
+
+
+def add_baseline_preservation_features(
+    features: Dict[str, torch.Tensor],
+    baseline_ca: torch.Tensor,
+    active: bool,
+    baseline_mask: Optional[torch.Tensor] = None,
+    hard_active: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Attach recycle-shaped baseline C-alpha targets to processed features."""
+    residue_index = features["residue_index"]
+    seq_mask = features["seq_mask"]
+    if residue_index.ndim < 2 or seq_mask.shape != residue_index.shape:
+        raise ValueError(
+            "Expected processed residue_index/seq_mask with a recycle axis"
+        )
+    indices = residue_index[..., 0].long()
+    valid = seq_mask[..., 0] > 0
+    if (
+        torch.any(indices[valid] < 0)
+        or torch.any(indices[valid] >= len(baseline_ca))
+    ):
+        observed = indices[valid]
+        raise ValueError(
+            "Processed residue_index falls outside aligned baseline: "
+            f"min={int(observed.min())}, max={int(observed.max())}, "
+            f"target_length={len(baseline_ca)}"
+        )
+    if baseline_mask is None:
+        baseline_mask = torch.ones(len(baseline_ca), dtype=torch.float32)
+    baseline_mask = baseline_mask.to(residue_index.device)
+    valid = valid & (baseline_mask[indices] > 0)
+    target = torch.zeros(
+        (*indices.shape, 3),
+        dtype=torch.float32,
+        device=residue_index.device,
+    )
+    target[valid] = baseline_ca.to(residue_index.device)[indices[valid]]
+    recycle_count = residue_index.shape[-1]
+    features["baseline_ca_positions"] = (
+        target.unsqueeze(-1).expand(*target.shape, recycle_count).clone()
+    )
+    features["baseline_ca_mask"] = (
+        valid.to(torch.float32).unsqueeze(-1).expand(-1, recycle_count).clone()
+    )
+    features["baseline_preservation_active"] = torch.full(
+        (recycle_count,),
+        1.0 if active else 0.0,
+        dtype=torch.float32,
+        device=residue_index.device,
+    )
+    features["baseline_hard_active"] = torch.full(
+        (recycle_count,),
+        1.0 if hard_active else 0.0,
+        dtype=torch.float32,
+        device=residue_index.device,
+    )
+    return features
+
+
+def parse_hard_aware_ratios(ratios) -> Dict[str, float]:
+    if ratios is None:
+        return {"hard": 0.7, "medium": 0.15, "easy": 0.15}
+    if isinstance(ratios, str):
+        parts = [float(x) for x in ratios.split(",")]
+        if len(parts) != 3:
+            raise ValueError(
+                "hard_aware_ratios must be hard,medium,easy (three floats)"
+            )
+        hard, medium, easy = parts
+    elif isinstance(ratios, (list, tuple)) and len(ratios) == 3:
+        hard, medium, easy = [float(x) for x in ratios]
+    elif isinstance(ratios, dict):
+        hard = float(ratios["hard"])
+        medium = float(ratios["medium"])
+        easy = float(ratios["easy"])
+    else:
+        raise ValueError(f"Unsupported hard_aware_ratios: {ratios!r}")
+    total = hard + medium + easy
+    if total <= 0:
+        raise ValueError("hard_aware_ratios must sum to a positive value")
+    return {
+        "hard": hard / total,
+        "medium": medium / total,
+        "easy": easy / total,
+    }
+
+
+def allocate_stratum_counts(n: int, ratios: Dict[str, float], available: Dict[str, int]):
+    """Allocate draw counts with empty-stratum fallback."""
+    bands = ("hard", "medium", "easy")
+    active = [b for b in bands if available.get(b, 0) > 0]
+    fallback_applied = False
+    if not active:
+        return {"hard": 0, "medium": 0, "easy": 0}, True, "no_hard_local_data"
+    target = dict(ratios)
+    missing = [b for b in bands if available.get(b, 0) <= 0]
+    if missing:
+        fallback_applied = True
+        redistribute = sum(target[b] for b in missing)
+        for b in missing:
+            target[b] = 0.0
+        alive = [b for b in bands if target[b] > 0]
+        if not alive:
+            return {"hard": 0, "medium": 0, "easy": 0}, True, "no_hard_local_data"
+        scale = 1.0 / sum(target[b] for b in alive)
+        for b in alive:
+            target[b] *= scale
+        # If hard was empty, caller should switch to uniform; mark explicitly.
+        if "hard" in missing:
+            return (
+                {b: 0 for b in bands},
+                True,
+                "no_hard_local_data",
+            )
+    raw = {b: target.get(b, 0.0) * n for b in bands}
+    counts = {b: int(raw[b]) for b in bands}
+    # Fix rounding to exact n using largest remainders among active bands.
+    remainder = n - sum(counts.values())
+    order = sorted(
+        [b for b in bands if target.get(b, 0.0) > 0],
+        key=lambda b: (raw[b] - counts[b]),
+        reverse=True,
+    )
+    idx = 0
+    while remainder > 0 and order:
+        counts[order[idx % len(order)]] += 1
+        remainder -= 1
+        idx += 1
+    return counts, fallback_applied, None
+
+
+def compute_sampling_audit(
+    labels,
+    label_to_cluster,
+    label_to_difficulty=None,
+    target_ratios=None,
+    fallback_applied=False,
+    fallback_reason=None,
+    cumulative_labels=None,
+):
     labels = [str(label) for label in labels]
     clusters = [
         label_to_cluster.get(label.upper(), f"singleton:{label.upper()}")
@@ -48,14 +303,48 @@ def compute_sampling_audit(labels, label_to_cluster):
         if denominator
         else 0.0
     )
-    return {
+    label_to_difficulty = label_to_difficulty or {}
+    bands = [
+        label_to_difficulty.get(label.upper(), "unknown")
+        for label in labels
+    ]
+    band_counts = Counter(bands)
+    hard_labels = {
+        label for label, band in zip(labels, bands) if band == "hard"
+    }
+    hard_clusters = {
+        cluster
+        for label, cluster, band in zip(labels, clusters, bands)
+        if band == "hard"
+    }
+    realized = {
+        band: (band_counts.get(band, 0) / len(labels) if labels else 0.0)
+        for band in ("hard", "medium", "easy", "unknown")
+    }
+    if cumulative_labels is None:
+        coverage = None
+    else:
+        coverage = len(set(cumulative_labels))
+    audit = {
         "draw_count": len(labels),
         "unique_label_count": len(set(labels)),
         "unique_cluster_count": len(cluster_counts),
         "cluster_frequencies": dict(sorted(cluster_counts.items())),
         "cluster_sampling_ess": ess,
         "train_epoch_len_semantics": "random_draw_count_not_dataset_pass",
+        "hard_draws": band_counts.get("hard", 0),
+        "medium_draws": band_counts.get("medium", 0),
+        "easy_draws": band_counts.get("easy", 0),
+        "unknown_draws": band_counts.get("unknown", 0),
+        "unique_hard_labels": len(hard_labels),
+        "unique_hard_clusters": len(hard_clusters),
+        "realized_ratios": realized,
+        "target_ratios": target_ratios,
+        "fallback_applied": bool(fallback_applied),
+        "fallback_reason": fallback_reason,
+        "cumulative_label_coverage": coverage,
     }
+    return audit
 
 
 class OpenFoldSingleDataset(torch.utils.data.Dataset):
@@ -581,11 +870,35 @@ class OpenFoldDataset(torch.utils.data.Dataset):
                  epoch_len: int,
                  generator: torch.Generator = None,
                  _roll_at_init: bool = True,
+                 sampling_mode: str = "uniform",
+                 difficulty_by_chain: Optional[Dict[str, str]] = None,
+                 hard_aware_ratios: Optional[Dict[str, float]] = None,
+                 difficulty_conditioned_fape: bool = False,
+                 baseline_preservation_dir: Optional[str] = None,
                  ):
         self.datasets = datasets
         self.probabilities = probabilities
         self.epoch_len = epoch_len
         self.generator = generator
+        self.sampling_mode = sampling_mode or "uniform"
+        self.difficulty_by_chain = {
+            key.upper(): value
+            for key, value in (difficulty_by_chain or {}).items()
+        }
+        self.hard_aware_ratios = parse_hard_aware_ratios(hard_aware_ratios)
+        self.difficulty_conditioned_fape = bool(
+            difficulty_conditioned_fape
+        )
+        self.baseline_preservation_dir = baseline_preservation_dir
+        self._baseline_ca_cache: Dict[
+            str, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._last_sampling_meta = {
+            "fallback_applied": False,
+            "fallback_reason": None,
+            "target_ratios": None,
+            "sampling_mode": self.sampling_mode,
+        }
 
         self._samples = [self.looped_samples(i) for i in range(len(self.datasets))]
         if _roll_at_init:
@@ -677,23 +990,183 @@ class OpenFoldDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         dataset_idx, datapoint_idx = self.datapoints[idx]
-        return self.datasets[dataset_idx][datapoint_idx]
+        dataset = self.datasets[dataset_idx]
+        features = dataset[datapoint_idx]
+        if self.difficulty_conditioned_fape:
+            chain_id = dataset.idx_to_chain_id(datapoint_idx)
+            band = self.difficulty_by_chain.get(
+                str(chain_id).upper(), "unknown"
+            )
+            clamp_value = difficulty_conditioned_fape_clamp_value(band)
+            if clamp_value is not None:
+                if "use_clamped_fape" not in features:
+                    raise KeyError(
+                        "use_clamped_fape missing from train features"
+                    )
+                features["use_clamped_fape"] = torch.full_like(
+                    features["use_clamped_fape"], clamp_value
+                )
+        if self.baseline_preservation_dir:
+            chain_id = str(dataset.idx_to_chain_id(datapoint_idx))
+            band = self.difficulty_by_chain.get(
+                chain_id.upper(), "unknown"
+            )
+            if chain_id not in self._baseline_ca_cache:
+                prediction = os.path.join(
+                    self.baseline_preservation_dir,
+                    f"{chain_id}_seq_model_esm1b_ptm_unrelaxed.pdb",
+                )
+                if not os.path.isfile(prediction):
+                    raise FileNotFoundError(prediction)
+                baseline_sequence, baseline_ca = read_pdb_ca_structure(
+                    prediction
+                )
+                train_sequence = dataset.chain_data_cache[chain_id]["seq"]
+                self._baseline_ca_cache[chain_id] = (
+                    align_baseline_ca_to_sequence(
+                        baseline_sequence,
+                        baseline_ca,
+                        train_sequence,
+                    )
+                )
+            baseline_ca, baseline_mask = self._baseline_ca_cache[chain_id]
+            features = add_baseline_preservation_features(
+                features,
+                baseline_ca,
+                active=band in {"medium", "easy"},
+                baseline_mask=baseline_mask,
+                hard_active=band == "hard",
+            )
+        return features
 
     def __len__(self):
         return self.epoch_len
 
-    def reroll(self):
-        dataset_choices = torch.multinomial(
-            torch.tensor(self.probabilities),
-            num_samples=self.epoch_len,
+    def _eligible_indices_by_band(self, dataset_idx: int):
+        dataset = self.datasets[dataset_idx]
+        by_band = {"hard": [], "medium": [], "easy": [], "unknown": []}
+        for datapoint_idx in range(len(dataset)):
+            chain_id = dataset.idx_to_chain_id(datapoint_idx)
+            entry = dataset.chain_data_cache[chain_id]
+            if not self.deterministic_train_filter(entry):
+                continue
+            band = self.difficulty_by_chain.get(str(chain_id).upper(), "unknown")
+            by_band.setdefault(band, []).append(datapoint_idx)
+        return by_band
+
+    def _sample_indices_with_weights(
+        self,
+        dataset,
+        indices: List[int],
+        n: int,
+    ) -> List[int]:
+        if n <= 0:
+            return []
+        if not indices:
+            raise ValueError("Cannot sample from an empty stratum")
+        weights = []
+        for idx in indices:
+            chain_id = dataset.idx_to_chain_id(idx)
+            entry = dataset.chain_data_cache[chain_id]
+            p = self.get_stochastic_train_filter_prob(entry)
+            weights.append(max(float(p), 1e-8))
+        chosen = torch.multinomial(
+            torch.tensor(weights, dtype=torch.float64),
+            num_samples=n,
             replacement=True,
             generator=self.generator,
         )
+        return [indices[int(i)] for i in chosen]
+
+    def reroll(self):
+        if self.sampling_mode == "uniform":
+            dataset_choices = torch.multinomial(
+                torch.tensor(self.probabilities),
+                num_samples=self.epoch_len,
+                replacement=True,
+                generator=self.generator,
+            )
+            self.datapoints = []
+            for dataset_idx in dataset_choices:
+                samples = self._samples[int(dataset_idx)]
+                datapoint_idx = next(samples)
+                self.datapoints.append((int(dataset_idx), int(datapoint_idx)))
+            self._last_sampling_meta = {
+                "fallback_applied": False,
+                "fallback_reason": None,
+                "target_ratios": None,
+                "sampling_mode": "uniform",
+            }
+            return
+
+        if self.sampling_mode not in (
+            "hard_aware",
+            "hard_aware_50",
+            "hard_aware_70",
+        ):
+            raise ValueError(f"Unknown sampling_mode: {self.sampling_mode}")
+
+        ratios = self.hard_aware_ratios
+        if self.sampling_mode == "hard_aware_50":
+            ratios = parse_hard_aware_ratios("0.5,0.25,0.25")
+        elif self.sampling_mode == "hard_aware_70":
+            ratios = parse_hard_aware_ratios("0.7,0.15,0.15")
+
+        # MVP assumes a single train dataset (no distillation mixture).
+        dataset_idx = 0
+        dataset = self.datasets[dataset_idx]
+        by_band = self._eligible_indices_by_band(dataset_idx)
+        available = {band: len(idxs) for band, idxs in by_band.items()}
+        counts, fallback_applied, fallback_reason = allocate_stratum_counts(
+            self.epoch_len,
+            ratios,
+            available,
+        )
+        if fallback_reason == "no_hard_local_data":
+            # Fall back to existing uniform/cluster-filtered stream.
+            dataset_choices = torch.multinomial(
+                torch.tensor(self.probabilities),
+                num_samples=self.epoch_len,
+                replacement=True,
+                generator=self.generator,
+            )
+            self.datapoints = []
+            for d_idx in dataset_choices:
+                samples = self._samples[int(d_idx)]
+                datapoint_idx = next(samples)
+                self.datapoints.append((int(d_idx), int(datapoint_idx)))
+            self._last_sampling_meta = {
+                "fallback_applied": True,
+                "fallback_reason": "no_hard_local_data",
+                "target_ratios": ratios,
+                "sampling_mode": self.sampling_mode,
+            }
+            return
+
         self.datapoints = []
-        for dataset_idx in dataset_choices:
-            samples = self._samples[dataset_idx]
-            datapoint_idx = next(samples)
-            self.datapoints.append((dataset_idx, datapoint_idx))
+        for band in ("hard", "medium", "easy"):
+            n = counts.get(band, 0)
+            if n <= 0:
+                continue
+            sampled = self._sample_indices_with_weights(
+                dataset,
+                by_band[band],
+                n,
+            )
+            self.datapoints.extend((dataset_idx, idx) for idx in sampled)
+        # Shuffle draw order for SGD.
+        if len(self.datapoints) > 1:
+            order = torch.randperm(
+                len(self.datapoints),
+                generator=self.generator,
+            )
+            self.datapoints = [self.datapoints[int(i)] for i in order]
+        self._last_sampling_meta = {
+            "fallback_applied": fallback_applied,
+            "fallback_reason": fallback_reason,
+            "target_ratios": ratios,
+            "sampling_mode": self.sampling_mode,
+        }
 
 
 class OpenFoldMultimerDataset(OpenFoldDataset):
@@ -904,6 +1377,11 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  train_epoch_len: int = 50000,
                  sampling_audit_path: Optional[str] = None,
                  sampling_cluster_file: Optional[str] = None,
+                 sampling_mode: str = "uniform",
+                 difficulty_csv: Optional[str] = None,
+                 hard_aware_ratios: Optional[str] = None,
+                 difficulty_conditioned_fape: bool = False,
+                 baseline_preservation_dir: Optional[str] = None,
                  _distillation_structure_index_path: Optional[str] = None,
                  alignment_index_path: Optional[str] = None,
                  distillation_alignment_index_path: Optional[str] = None,
@@ -939,7 +1417,15 @@ class OpenFoldDataModule(pl.LightningDataModule):
         self.sampling_label_to_cluster = load_sampling_clusters(
             sampling_cluster_file
         )
+        self.sampling_mode = sampling_mode or "uniform"
+        self.difficulty_by_chain = load_difficulty_bands(difficulty_csv)
+        self.hard_aware_ratios = hard_aware_ratios
+        self.difficulty_conditioned_fape = bool(
+            difficulty_conditioned_fape
+        )
+        self.baseline_preservation_dir = baseline_preservation_dir
         self._sampling_audit_epoch = 0
+        self._sampled_label_history = set()
 
         if self.train_data_dir is None and self.predict_data_dir is None:
             raise ValueError(
@@ -1037,6 +1523,13 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 epoch_len=self.train_epoch_len,
                 generator=generator,
                 _roll_at_init=False,
+                sampling_mode=self.sampling_mode,
+                difficulty_by_chain=self.difficulty_by_chain,
+                hard_aware_ratios=self.hard_aware_ratios,
+                difficulty_conditioned_fape=(
+                    self.difficulty_conditioned_fape
+                ),
+                baseline_preservation_dir=self.baseline_preservation_dir,
             )
 
             if self.val_data_dir is not None:
@@ -1102,11 +1595,19 @@ class OpenFoldDataModule(pl.LightningDataModule):
             )
             for dataset_idx, datapoint_idx in dataset.datapoints
         ]
+        self._sampled_label_history.update(labels)
+        meta = getattr(dataset, "_last_sampling_meta", {}) or {}
         audit = compute_sampling_audit(
             labels,
             self.sampling_label_to_cluster,
+            label_to_difficulty=self.difficulty_by_chain,
+            target_ratios=meta.get("target_ratios"),
+            fallback_applied=meta.get("fallback_applied", False),
+            fallback_reason=meta.get("fallback_reason"),
+            cumulative_labels=self._sampled_label_history,
         )
         audit["epoch_index"] = self._sampling_audit_epoch
+        audit["sampling_mode"] = meta.get("sampling_mode", self.sampling_mode)
         self._sampling_audit_epoch += 1
         path = os.path.abspath(self.sampling_audit_path)
         os.makedirs(os.path.dirname(path), exist_ok=True)

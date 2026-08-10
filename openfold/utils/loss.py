@@ -1682,6 +1682,230 @@ def chain_center_of_mass_loss(
     return loss
 
 
+def baseline_distance_preservation_loss(
+    all_atom_pred_pos: torch.Tensor,
+    baseline_ca_positions: torch.Tensor,
+    baseline_ca_mask: torch.Tensor,
+    baseline_preservation_active: torch.Tensor,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Huber loss on C-alpha pair distances for active baseline anchors."""
+    ca_index = residue_constants.atom_order["CA"]
+    pred_ca = all_atom_pred_pos[..., ca_index, :]
+    target_ca = baseline_ca_positions.to(dtype=pred_ca.dtype)
+    mask = baseline_ca_mask.to(dtype=pred_ca.dtype)
+    active = baseline_preservation_active.to(dtype=pred_ca.dtype)
+
+    if pred_ca.shape != target_ca.shape:
+        raise ValueError(
+            "Predicted/baseline C-alpha shape mismatch: "
+            f"{tuple(pred_ca.shape)} != {tuple(target_ca.shape)}"
+        )
+    if mask.shape != pred_ca.shape[:-1]:
+        raise ValueError(
+            "baseline_ca_mask shape mismatch: "
+            f"{tuple(mask.shape)} != {tuple(pred_ca.shape[:-1])}"
+        )
+
+    pred_distances = torch.cdist(pred_ca, pred_ca)
+    target_distances = torch.cdist(target_ca, target_ca)
+    errors = torch.nn.functional.smooth_l1_loss(
+        pred_distances,
+        target_distances,
+        reduction="none",
+        beta=beta,
+    )
+    n_res = pred_ca.shape[-2]
+    upper_triangle = torch.triu(
+        torch.ones(
+            (n_res, n_res),
+            dtype=pred_ca.dtype,
+            device=pred_ca.device,
+        ),
+        diagonal=1,
+    )
+    pair_mask = mask[..., :, None] * mask[..., None, :] * upper_triangle
+    per_example = torch.sum(errors * pair_mask, dim=(-1, -2))
+    per_example = per_example / torch.sum(
+        pair_mask, dim=(-1, -2)
+    ).clamp(min=1.0)
+    active = active.reshape(per_example.shape)
+    return torch.sum(per_example * active) / torch.sum(active).clamp(min=1.0)
+
+def baseline_guided_hard_correction_loss(
+    all_atom_pred_pos: torch.Tensor,
+    all_atom_positions: torch.Tensor,
+    all_atom_mask: torch.Tensor,
+    baseline_ca_positions: torch.Tensor,
+    baseline_ca_mask: torch.Tensor,
+    baseline_hard_active: torch.Tensor,
+    margin: float = 0.5,
+    min_baseline_error: float = 2.0,
+    min_sequence_separation: int = 12,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Require baseline-hard long-range C-alpha distances to improve by a margin."""
+    ca_index = residue_constants.atom_order["CA"]
+    pred_ca = all_atom_pred_pos[..., ca_index, :]
+    native_ca = all_atom_positions[..., ca_index, :].to(dtype=pred_ca.dtype)
+    baseline_ca = baseline_ca_positions.to(dtype=pred_ca.dtype)
+    native_mask = all_atom_mask[..., ca_index].to(dtype=pred_ca.dtype)
+    baseline_mask = baseline_ca_mask.to(dtype=pred_ca.dtype)
+    active = baseline_hard_active.to(dtype=pred_ca.dtype)
+
+    if pred_ca.shape != native_ca.shape or pred_ca.shape != baseline_ca.shape:
+        raise ValueError(
+            "Hard-correction C-alpha shape mismatch: "
+            f"pred={tuple(pred_ca.shape)}, native={tuple(native_ca.shape)}, "
+            f"baseline={tuple(baseline_ca.shape)}"
+        )
+    if native_mask.shape != pred_ca.shape[:-1]:
+        raise ValueError(
+            "Hard-correction native mask shape mismatch: "
+            f"{tuple(native_mask.shape)} != {tuple(pred_ca.shape[:-1])}"
+        )
+    if baseline_mask.shape != pred_ca.shape[:-1]:
+        raise ValueError(
+            "Hard-correction baseline mask shape mismatch: "
+            f"{tuple(baseline_mask.shape)} != {tuple(pred_ca.shape[:-1])}"
+        )
+
+    pred_distances = torch.cdist(pred_ca, pred_ca)
+    native_distances = torch.cdist(native_ca, native_ca)
+    baseline_distances = torch.cdist(baseline_ca, baseline_ca)
+    pred_error = torch.sqrt(
+        torch.square(pred_distances - native_distances) + eps
+    )
+    baseline_error = torch.sqrt(
+        torch.square(baseline_distances - native_distances) + eps
+    ).detach()
+
+    n_res = pred_ca.shape[-2]
+    residue_indices = torch.arange(n_res, device=pred_ca.device)
+    sequence_separation = torch.abs(
+        residue_indices[:, None] - residue_indices[None, :]
+    )
+    pair_selector = (
+        (sequence_separation >= int(min_sequence_separation))
+        & (baseline_error >= float(min_baseline_error))
+    ).to(dtype=pred_ca.dtype)
+    valid = native_mask * baseline_mask
+    pair_mask = valid[..., :, None] * valid[..., None, :] * pair_selector
+    # Larger baseline errors are more informative, but cap their leverage.
+    pair_weight = torch.clamp(
+        baseline_error / max(float(min_baseline_error), eps),
+        min=1.0,
+        max=4.0,
+    )
+    margin_loss = torch.relu(
+        pred_error - baseline_error + float(margin)
+    )
+    weighted_mask = pair_mask * pair_weight
+    per_example = torch.sum(
+        margin_loss * weighted_mask, dim=(-1, -2)
+    ) / torch.sum(weighted_mask, dim=(-1, -2)).clamp(min=1.0)
+    active = active.reshape(per_example.shape)
+    return torch.sum(per_example * active) / torch.sum(active).clamp(min=1.0)
+
+
+def _masked_kabsch_soft_tm_score(
+    mobile_ca: torch.Tensor,
+    target_ca: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Differentiable soft-TM score after a detached optimal RMSD rotation."""
+    weights = mask.to(dtype=mobile_ca.dtype)
+    count = torch.sum(weights, dim=-1).clamp(min=1.0)
+    mobile_center = torch.sum(
+        mobile_ca * weights[..., None], dim=-2
+    ) / count[..., None]
+    target_center = torch.sum(
+        target_ca * weights[..., None], dim=-2
+    ) / count[..., None]
+    mobile_centered = mobile_ca - mobile_center[..., None, :]
+    target_centered = target_ca - target_center[..., None, :]
+    covariance = torch.matmul(
+        (mobile_centered * weights[..., None]).transpose(-1, -2),
+        target_centered,
+    )
+    u, _, vh = torch.linalg.svd(covariance)
+    uncorrected = torch.matmul(u, vh)
+    determinant = torch.linalg.det(uncorrected)
+    correction = torch.ones(
+        (*determinant.shape, 3),
+        dtype=mobile_ca.dtype,
+        device=mobile_ca.device,
+    )
+    correction[..., -1] = torch.where(
+        determinant < 0.0,
+        determinant.new_tensor(-1.0),
+        determinant.new_tensor(1.0),
+    )
+    rotation = torch.matmul(
+        u * correction[..., None, :],
+        vh,
+    ).detach()
+    aligned = torch.matmul(mobile_centered, rotation)
+    distances = torch.sqrt(
+        torch.sum(
+            torch.square(aligned - target_centered),
+            dim=-1,
+        )
+        + eps
+    )
+    d0 = 1.24 * torch.pow(
+        torch.clamp(count - 15.0, min=1.0),
+        1.0 / 3.0,
+    ) - 1.8
+    d0 = torch.clamp(d0, min=0.5)
+    per_residue = 1.0 / (1.0 + torch.square(distances / d0[..., None]))
+    return torch.sum(per_residue * weights, dim=-1) / count
+
+
+def baseline_guided_hard_soft_tm_loss(
+    all_atom_pred_pos: torch.Tensor,
+    all_atom_positions: torch.Tensor,
+    all_atom_mask: torch.Tensor,
+    baseline_ca_positions: torch.Tensor,
+    baseline_ca_mask: torch.Tensor,
+    baseline_hard_active: torch.Tensor,
+    score_margin: float = 0.02,
+) -> torch.Tensor:
+    """Require baseline-hard predictions to improve a soft aligned TM score."""
+    ca_index = residue_constants.atom_order["CA"]
+    pred_ca = all_atom_pred_pos[..., ca_index, :]
+    native_ca = all_atom_positions[..., ca_index, :].to(dtype=pred_ca.dtype)
+    baseline_ca = baseline_ca_positions.to(dtype=pred_ca.dtype)
+    native_mask = all_atom_mask[..., ca_index].to(dtype=pred_ca.dtype)
+    baseline_mask = baseline_ca_mask.to(dtype=pred_ca.dtype)
+    mask = native_mask * baseline_mask
+    active = baseline_hard_active.to(dtype=pred_ca.dtype)
+
+    if pred_ca.shape != native_ca.shape or pred_ca.shape != baseline_ca.shape:
+        raise ValueError(
+            "Soft-TM C-alpha shape mismatch: "
+            f"pred={tuple(pred_ca.shape)}, native={tuple(native_ca.shape)}, "
+            f"baseline={tuple(baseline_ca.shape)}"
+        )
+    if mask.shape != pred_ca.shape[:-1]:
+        raise ValueError(
+            "Soft-TM mask shape mismatch: "
+            f"{tuple(mask.shape)} != {tuple(pred_ca.shape[:-1])}"
+        )
+
+    pred_score = _masked_kabsch_soft_tm_score(pred_ca, native_ca, mask)
+    baseline_score = _masked_kabsch_soft_tm_score(
+        baseline_ca, native_ca, mask
+    ).detach()
+    per_example = torch.relu(
+        baseline_score + float(score_margin) - pred_score
+    )
+    active = active.reshape(per_example.shape)
+    return torch.sum(per_example * active) / torch.sum(active).clamp(min=1.0)
+
+
+
 class AlphaFoldLoss(nn.Module):
     """Aggregation of the various losses described in the supplement"""
 

@@ -81,13 +81,20 @@ def read_baseline_difficulty(path: Path | None) -> dict[str, float]:
 
 
 def difficulty_band(value):
+    """Map baseline TM to hard/medium/easy (hard: TM < 0.5)."""
     if value is None:
         return "unknown"
-    if value < 0.6:
+    if value < 0.5:
         return "hard"
     if value < 0.8:
         return "medium"
     return "easy"
+
+
+def difficulty_weight(baseline_tm):
+    if baseline_tm is None:
+        return 0.0
+    return max(0.0, (0.5 - float(baseline_tm)) / 0.5)
 
 
 def split_by_cluster(

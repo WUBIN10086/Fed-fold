@@ -35,8 +35,12 @@ from pytorch_lightning.utilities.deepspeed import (
 )
 
 
-def load_client_params(ckpt_path: str) -> dict:
-    """从一个 client checkpoint 提取 AlphaFold 层级的参数字典（优先 EMA）。"""
+def load_client_params(ckpt_path: str, weights_source: str = "ema") -> dict:
+    """从一个 client checkpoint 提取 AlphaFold 层级的参数字典。
+
+    注意：此脚本是完整参数 FedAvg 参考实现，不是 FedLoRA 主聚合器。
+    FedLoRA MVP 请使用 scripts/fedlora_aggregate.py（raw effective-delta）。
+    """
     p = Path(ckpt_path)
 
     if p.is_dir():
@@ -48,15 +52,43 @@ def load_client_params(ckpt_path: str) -> dict:
     else:
         d = torch.load(str(p), map_location="cpu")
 
-    # 1) 训练 checkpoint：EMA 参数就是推理用的那套
-    if isinstance(d, dict) and "ema" in d and isinstance(d["ema"], dict) and "params" in d["ema"]:
-        return d["ema"]["params"]
-    # 2) Lightning state_dict：键带 'model.' 前缀，剥掉得到 AlphaFold 层级键
-    if isinstance(d, dict) and "state_dict" in d:
-        sd = d["state_dict"]
-        return {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
-    # 3) 已经是纯参数字典（如官方 base 权重）
-    return d
+    if weights_source == "ema":
+        if isinstance(d, dict) and "ema" in d and isinstance(d["ema"], dict) and "params" in d["ema"]:
+            print(
+                f"[warn] fedavg_aggregate loading EMA params from {ckpt_path}; "
+                "short LoRA runs with decay=0.999 make EMA lag initialization. "
+                "Prefer scripts/fedlora_aggregate.py for FedLoRA."
+            )
+            return d["ema"]["params"]
+        raise ValueError(
+            f"--weights-source ema requested but checkpoint has no ema.params: {ckpt_path}"
+        )
+    if weights_source == "model":
+        if isinstance(d, dict) and "state_dict" in d:
+            sd = d["state_dict"]
+            return {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+        if isinstance(d, dict) and "module" in d and isinstance(d["module"], dict):
+            return d["module"]
+        tensors = {
+            k: v for k, v in d.items()
+            if isinstance(k, str) and torch.is_tensor(v)
+        }
+        if tensors:
+            return tensors
+        raise ValueError(f"Could not extract model weights from {ckpt_path}")
+    if weights_source == "auto":
+        # Preserve legacy preference but warn.
+        if isinstance(d, dict) and "ema" in d and isinstance(d["ema"], dict) and "params" in d["ema"]:
+            print(
+                f"[warn] fedavg_aggregate auto-selected EMA from {ckpt_path}; "
+                "use --weights-source model or scripts/fedlora_aggregate.py for FedLoRA."
+            )
+            return d["ema"]["params"]
+        if isinstance(d, dict) and "state_dict" in d:
+            sd = d["state_dict"]
+            return {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+        return d
+    raise ValueError(f"Unknown weights_source: {weights_source}")
 
 
 def fedavg(param_dicts: list[dict], weights: list[float]) -> dict:
@@ -101,6 +133,15 @@ def main():
         help="各 client 的聚合权重（数量需与 --checkpoints 一致）。默认等权。"
              "标准 FedAvg 用各 client 训练样本数。",
     )
+    parser.add_argument(
+        "--weights-source",
+        choices=("ema", "model", "auto"),
+        default="auto",
+        help=(
+            "Checkpoint weight source. Default auto preserves legacy EMA "
+            "preference but warns. For FedLoRA use scripts/fedlora_aggregate.py."
+        ),
+    )
     args = parser.parse_args()
 
     n = len(args.checkpoints)
@@ -111,11 +152,11 @@ def main():
             raise ValueError(f"--weights 数量({len(args.weights)}) 必须等于 checkpoint 数量({n})")
         weights = args.weights
 
-    print(f"聚合 {n} 个 client，权重={weights}")
+    print(f"聚合 {n} 个 client，权重={weights}, weights_source={args.weights_source}")
     param_dicts = []
     for i, ckpt in enumerate(args.checkpoints):
         print(f"  [{i}] 读取 {ckpt}")
-        param_dicts.append(load_client_params(ckpt))
+        param_dicts.append(load_client_params(ckpt, weights_source=args.weights_source))
 
     print("正在做加权平均...")
     global_params = fedavg(param_dicts, weights)

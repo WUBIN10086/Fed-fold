@@ -1,11 +1,17 @@
 """Merge an OpenFold LoRA checkpoint into a plain AlphaFold state dict."""
 
 import argparse
+import hashlib
 import json
+import sys
 import tempfile
 import warnings
 from pathlib import Path
 from typing import Dict, Mapping, Set, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 from pytorch_lightning.utilities.deepspeed import (
@@ -17,6 +23,31 @@ from openfold.model.model import AlphaFold
 from openfold.utils.import_weights import import_openfold_weights_
 from openfold.utils.lora import LoRAConfig
 from openfold.utils.training_utils import extract_alphafold_weights
+from scripts.lora_schema import (
+    adapter_key_dtypes,
+    adapter_key_shapes,
+    fingerprint_from_adapters,
+)
+
+
+def sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.is_file():
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    files = sorted(item for item in path.rglob("*") if item.is_file())
+    if not files:
+        raise ValueError(f"Cannot fingerprint empty checkpoint directory: {path}")
+    for item in files:
+        digest.update(str(item.relative_to(path)).encode("utf-8"))
+        with item.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_checkpoint(path: Path) -> Mapping[str, object]:
@@ -332,8 +363,24 @@ def export_lora_checkpoint(
         base=base,
         target_keys=target_keys,
     )
+    parent_sha256 = sha256_path(base_checkpoint_path)
+    schema_fingerprint = fingerprint_from_adapters(
+        adapters,
+        target=str(lora_config.target),
+        rank=int(lora_config.rank),
+        alpha=float(lora_config.alpha),
+        parent_sha256=parent_sha256,
+    )
     report = compare_export_to_base(merged, base, target_keys)
     report.update({
+        "base_checkpoint_sha256": parent_sha256,
+        "adapter_checkpoint_sha256": sha256_path(input_path),
+        "lora_target": str(lora_config.target),
+        "lora_schema_fingerprint": schema_fingerprint,
+        "adapter_dtypes": adapter_key_dtypes(adapters),
+        "adapter_shapes": adapter_key_shapes(adapters),
+        "adapter_key_count": len(adapter_key_shapes(adapters)),
+        "scale_semantics": "unit_raw_delta",
         "base_checkpoint": str(base_checkpoint_path),
         "base_weights_source": base_weights_source,
         "adapter_checkpoint": str(input_path),
@@ -352,6 +399,7 @@ def export_lora_checkpoint(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(merged, str(output_path))
+    report["output_sha256"] = sha256_path(output_path)
     return len(merged), lora_config, report
 
 
@@ -367,8 +415,12 @@ def main():
     )
     parser.add_argument(
         "--base-weights-source",
-        choices=("ema", "module"),
+        choices=("ema", "module", "state_dict", "auto"),
         default="ema",
+        help=(
+            "Base checkpoint source. Use auto for the pure global_model.pt "
+            "created by fed_lora_hardcase_fed.sh."
+        ),
     )
     parser.add_argument(
         "--adapter-weights-source",
@@ -418,12 +470,38 @@ def main():
         lora_scale=args.lora_scale,
         overwrite=args.overwrite,
     )
+    naming = (
+        f"base_{args.base_weights_source}_adapter_{adapter_source}"
+        f"_scale{args.lora_scale:g}"
+    )
+    sidecar = {
+        "output": str(args.output),
+        "recommended_stem": naming,
+        "base_weights_source": args.base_weights_source,
+        "adapter_weights_source": adapter_source,
+        "lora_rank": config.rank,
+        "lora_alpha": config.alpha,
+        "lora_scale": args.lora_scale,
+        "lora_target": config.target,
+        "base_checkpoint_sha256": report["base_checkpoint_sha256"],
+        "adapter_checkpoint_sha256": report["adapter_checkpoint_sha256"],
+        "output_sha256": report["output_sha256"],
+        "lora_schema_fingerprint": report["lora_schema_fingerprint"],
+        "adapter_dtypes": report["adapter_dtypes"],
+        "adapter_shapes": report["adapter_shapes"],
+        "adapter_key_count": report["adapter_key_count"],
+        "scale_semantics": report["scale_semantics"],
+        "report": report,
+    }
+    sidecar_path = args.output.with_suffix(".export_manifest.json")
+    sidecar_path.write_text(json.dumps(sidecar, indent=2, sort_keys=True) + "\n")
     print(
         f"Exported {count} FP32-base AlphaFold tensors using "
         f"{adapter_source} adapters with LoRA rank={config.rank}, "
         f"alpha={config.alpha}, scale={args.lora_scale} to {args.output}"
     )
     print(json.dumps(report, indent=2, sort_keys=True))
+    print(f"Wrote export manifest {sidecar_path}")
 
 
 if __name__ == "__main__":

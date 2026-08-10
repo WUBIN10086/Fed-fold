@@ -27,3 +27,7 @@ cutlass/
 embeddings_output_dir/
 predictions/
 examples/monomer/fasta_dir/
+outputs/fed_lora_fp32/
+outputs/fedfold_lora_hardcase_loss_opt/
+outputs/fed_lora_hardcase_fed_v1/
+outputs/fedfold_lora_hardcase_loss_opt_fed/
